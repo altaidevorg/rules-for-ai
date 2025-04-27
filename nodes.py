@@ -557,7 +557,7 @@ class WriteChapters(BatchNode):
         previous_chapters_summary = "\n---\n".join(self.chapters_written_so_far)
 
         prompt = f"""
-Write a highly informative and technical tutorial chapter (in Markdown format with frontmatter described below) to teach the following concept in the project `{project_name}` to a coding AI agent: "{abstraction_name}". This is Chapter {chapter_num}.
+Write a highly informative and technical tutorial chapter to teach the following concept in the project `{project_name}` to a coding AI agent: "{abstraction_name}". This is Chapter {chapter_num}.
 
 Concept Details:
 - Name: {abstraction_name}
@@ -574,20 +574,23 @@ Relevant Code Snippets (Code itself remains unchanged):
 {file_context_str if file_context_str else "No specific code snippets provided for this abstraction."}
 
 Instructions for the chapter:
-- Start with a clear heading (e.g., `# Chapter {chapter_num}: {abstraction_name}`). Use the provided concept name.
-- Prepend the Markdown content with a frontmatter described below to tell the AI agent when to refer to this particular chapter:
+- Output in YAML format. Provide `description`, `globs` and `alwaysApply` metadata in addition to the chapter `content` in Markdown format.
+- Start `content` with a clear heading (e.g., `# Chapter {chapter_num}: {abstraction_name}`). Use the provided concept name.
+- Prepend the Markdown content with metadata described below to tell the AI agent when to refer to this particular chapter:
 
----
-description: A 10-15-word description containing the project name and abstractions / concepts detailed in this chapter.
-globs: Empty or a single glob pattern. If matched with a code file, it will be automatically picked by the AI agent. Empty almost all the time. Set it to a pattern only for **very, very specific abstractions**, e.g., a single class in a file.
+```yaml
+description: A 10-15-word description containing the project name and abstractions / concepts detailed in this chapter. AI will decide when to refer to this chapter based on this description.
+globs: Empty or a single glob pattern. If matched with a code file, it will be automatically picked by the AI agent whenever that file is mentioned. Empty almost all the time. Set it to a pattern only for **very, very specific abstractions**, e.g., a single class in a file.
 alwaysApply: false almost all the time. set it to true only for **very, very central abstractions**.
----
-
-- When writing the frontmatter, do not add any explanations or another type of comments for the values.
+content: |
+  Full chapter content in Markdown format.
+  It can span to multiple lines and paragraphs.
+  You can use **bold** and *italic* texts for emphasis.
+```
 
 - If this is not the first chapter, begin with a brief transition from the previous chapter referencing it with a proper Markdown link using its name.
 
-- Begin with a high-level motivation explaining what technical problem this abstraction solves. Continue with a central use case as a concrete example. The whole chapter should guide the coding AI agent to understand how to make use of it when developing with or for it. Make it very minimal and knowledge-dense for the AI agent.
+- Begin with a high-level motivation explaining what technical problem this abstraction solves. Continue with a central use case as a concrete example. The whole chapter should guide the coding AI agent to understand how to make use of it when developing with or for it.
 
 - If the abstraction is complex, break it down into key concepts. Explain each concept one-by-one in a very concrete way.
 
@@ -597,9 +600,9 @@ alwaysApply: false almost all the time. set it to true only for **very, very cen
 
 - Describe the internal implementation to help understand what's under the hood. First provide a non-code or code-light walkthrough on what happens step-by-step when the abstraction is called. It's recommended to use a simple sequenceDiagram with a dummy example - keep it minimal with at most 5 participants to ensure clarity. If participant name has space, use: `participant QP as Query Processing`.
 
-- Then dive deeper into code for the internal implementation with references to files. Provide example code blocks, but do so from a software engineering perspective.
+- Then dive deeper into code for the internal implementation with references to files. Provide example code blocks, but keep it minimal  and knowledge-dense, and do so only to help the AI agent better understand the inner working of the code at a higher level.
 
-- IMPORTANT: When you need to refer to other core abstractions covered in other chapters, ALWAYS use proper Markdown links like this: [Chapter Title](filename.md). Use the Complete Tutorial Structure above to find the correct filename and the chapter title. Translate the surrounding text.
+- IMPORTANT: When you need to refer to other core abstractions covered in other chapters, ALWAYS use proper Markdown links like this: [Chapter Title](filename.md). Use the Complete Tutorial Structure above to find the correct filename and the chapter title.
 
 - Use mermaid diagrams to illustrate complex concepts (```mermaid``` format)..
 
@@ -609,13 +612,31 @@ alwaysApply: false almost all the time. set it to true only for **very, very cen
 
 - Ensure the tone is technical and informatory.
 
-- Output *only* the Markdown content with frontmatter prepended for this chapter.
-
-Now, directly provide a technically oriented Markdown output (DON'T need ```markdown``` tags):
+Now provide the YAML output for this chapter.
 """
-        chapter_content = call_llm(prompt)
-        """# Basic validation/cleanup
-        actual_heading = f"# Chapter {chapter_num}: {abstraction_name}"  # Use potentially translated name
+        response = call_llm(prompt)
+        yaml_str = response.strip().split("```yaml")[1].rstrip("```")
+        chapter_data = yaml.safe_load(yaml_str)
+
+        # Basic validation/cleanup
+        if not isinstance(chapter_data, dict) or not all(
+            k in chapter_data
+            for k in ["description", "globs", "alwaysApply", "content"]
+        ):
+            raise ValueError(
+                "LLM output is not a dictionary or has missing keys", chapter_data
+            )
+
+        if not all(isinstance(k, str) for k in ["description", "globs", "content"]):
+            raise ValueError(
+                "description, globs or content is not a string", chapter_data
+            )
+
+        if not isinstance(chapter_data["alwaysApply"], bool):
+            raise ValueError("alwaysApply is not a bool", chapter_data["alwaysApply"])
+
+        chapter_content = chapter_data["content"]
+        actual_heading = f"# Chapter {chapter_num}: {abstraction_name}"
         if not chapter_content.strip().startswith(f"# Chapter {chapter_num}"):
             # Add heading if missing or incorrect, trying to preserve content
             lines = chapter_content.strip().split("\n")
@@ -626,12 +647,23 @@ Now, directly provide a technically oriented Markdown output (DON'T need ```mark
                 chapter_content = "\n".join(lines)
             else:  # Otherwise, prepend it
                 chapter_content = f"{actual_heading}\n\n{chapter_content}"
-                """
+
+        # prepare the frontmatter and
+        frontmatter = "---\ndescription: "
+        frontmatter += chapter_data["description"].strip()
+        frontmatter += "\nglobs: "
+        frontmatter += chapter_data["globs"].strip()
+        frontmatter += "\nalwaysApply: "
+        frontmatter += "true" if chapter_data["alwaysApply"] else "false"
+        frontmatter += "\n---\n"
+
+        # prepend it to the chapter content
+        chapter_content = frontmatter + chapter_content
 
         # Add the generated content to our temporary list for the next iteration's context
         self.chapters_written_so_far.append(chapter_content)
 
-        return chapter_content  # Return the Markdown string (potentially translated)
+        return chapter_content
 
     def post(self, shared, prep_res, exec_res_list):
         # exec_res_list contains the generated Markdown for each chapter, in order
@@ -714,7 +746,7 @@ class CombineTutorial(Node):
                 chapter_content = chapters_content[i]
                 if not chapter_content.endswith("\n\n"):
                     chapter_content += "\n\n"
-                chapter_content += "---\n\nGenerated by [AI Codebase Knowledge Builder](https://github.com/The-Pocket/Tutorial-Codebase-Knowledge)"
+                chapter_content += "---\n\nGenerated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)"
 
                 # Store filename and corresponding content
                 chapter_files.append({"filename": filename, "content": chapter_content})
@@ -724,7 +756,7 @@ class CombineTutorial(Node):
                 )
 
         # Add attribution to index content
-        index_content += "\n\n---\n\nGenerated by [AI Codebase Knowledge Builder](https://github.com/The-Pocket/Tutorial-Codebase-Knowledge)"
+        index_content += "\n\n---\n\nGenerated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)"
 
         return {
             "output_path": output_path,
@@ -737,7 +769,7 @@ class CombineTutorial(Node):
         index_content = prep_res["index_content"]
         chapter_files = prep_res["chapter_files"]
 
-        print(f"Combining tutorial into directory: {output_path}")
+        print(f"Combining rules into directory: {output_path}")
         # Rely on Node's built-in retry/fallback
         os.makedirs(output_path, exist_ok=True)
 
