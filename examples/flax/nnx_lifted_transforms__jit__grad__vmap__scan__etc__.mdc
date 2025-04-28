@@ -1,0 +1,454 @@
+---
+description: Details Flax NNX lifted transforms (nnx.jit, nnx.grad, nnx.vmap, nnx.scan) for applying JAX transformations directly to nnx.Module methods.
+globs: 
+alwaysApply: false
+---
+# Chapter 5: NNX Lifted Transforms (jit, grad, vmap, scan, etc.)
+
+In the [previous chapter](filters___filterlib__.mdc), we learned how Filters allow us to selectively target specific parts of an `nnx.Module`'s state. Now, we'll see how NNX leverages this, along with the functional API concepts ([nnx.Variable / nnx.VariableState](nnx_variable___nnx_variablestate.mdc), `split`/`merge`), to provide "lifted" versions of standard JAX transformations. These lifted transforms allow you to apply JAX's powerful features like compilation, automatic differentiation, and vectorization directly to methods of your stateful `nnx.Module` objects with a more familiar object-oriented syntax.
+
+## Motivation: JAX Transformations on Stateful Objects
+
+JAX transformations (`jax.jit`, `jax.grad`, `jax.vmap`, `jax.lax.scan`, etc.) are designed to work with *pure functions* – functions whose output depends only on their explicit inputs and which operate on immutable data (like JAX arrays or pytrees). However, `nnx.Module` instances are stateful Python objects, holding mutable [nnx.Variable](nnx_variable___nnx_variablestate.mdc) attributes.
+
+Applying JAX transformations directly to `nnx.Module` methods like `module.forward(x)` would typically fail because:
+1.  The method implicitly reads state from `self` (e.g., `self.kernel.value`).
+2.  The method might mutate state (e.g., update batch statistics or RNG keys).
+3.  The `nnx.Module` object itself is not directly a JAX-compatible pytree by default.
+
+The traditional way to handle this in JAX requires manually separating the module's static definition from its dynamic state, writing a pure function that takes the state explicitly, applying the JAX transform to the pure function, and then merging the updated state back. This is the core idea behind the [NNX Functional API (split/merge/state/update/graphdef)](nnx_functional_api__split_merge_state_update_graphdef_.mdc).
+
+NNX **lifted transforms** (`nnx.jit`, `nnx.grad`, `nnx.vmap`, `nnx.scan`, etc.) automate this entire process. They allow you to apply JAX transformations using a syntax that feels natural for object-oriented programming, hiding the underlying `split`/`merge` mechanics.
+
+## Central Use Case: JIT Compilation and Gradient Calculation
+
+Let's consider a typical training step involving JIT compilation and gradient calculation for an `nnx.Module`.
+
+```python
+import jax
+import jax.numpy as jnp
+from flax import nnx
+import optax # Common JAX optimizer library
+
+class SimpleMLP(nnx.Module):
+  def __init__(self, din: int, dhidden: int, dout: int, *, rngs: nnx.Rngs):
+    self.linear1 = nnx.Linear(din, dhidden, rngs=rngs)
+    self.linear2 = nnx.Linear(dhidden, dout, rngs=rngs)
+
+  def __call__(self, x: jax.Array) -> jax.Array:
+    x = self.linear1(x)
+    x = nnx.relu(x)
+    x = self.linear2(x)
+    return x
+
+# --- Setup ---
+key = jax.random.key(0)
+key, model_key, data_key = jax.random.split(key, 3)
+model = SimpleMLP(din=10, dhidden=20, dout=5, rngs=nnx.Rngs(model_key))
+optimizer_def = optax.adam(1e-3)
+# nnx.Optimizer manages optimizer state alongside model state
+optimizer = nnx.Optimizer(model, optimizer_def) 
+
+x_batch = jax.random.normal(data_key, (32, 10))
+y_batch = jnp.ones((32, 5)) # Dummy targets
+
+# --- Define Loss Function ---
+def loss_fn(model: SimpleMLP, x: jax.Array, y: jax.Array):
+  y_pred = model(x) # Direct call to model instance method
+  loss = jnp.mean((y_pred - y) ** 2)
+  return loss
+
+# --- Define and JIT the Training Step ---
+# Use nnx.value_and_grad to get loss and gradients for nnx.Param variables
+@nnx.jit # Use nnx.jit instead of jax.jit
+def train_step(optimizer: nnx.Optimizer, model: SimpleMLP, x: jax.Array, y: jax.Array):
+    # nnx.value_and_grad implicitly handles state splitting/merging
+    # By default, it computes gradients w.r.t. nnx.Param variables in the model
+    loss, grads = nnx.value_and_grad(loss_fn)(model, x, y)
+    
+    # nnx.Optimizer.update applies gradients to the model's state
+    optimizer.update(grads) 
+    
+    # The updated optimizer (containing updated model state and optimizer state)
+    # is implicitly returned by nnx.jit 
+    return loss, optimizer # We can also return other values
+
+# --- Execute Training Step ---
+loss, optimizer = train_step(optimizer, model, x_batch, y_batch)
+
+print(f"Loss after one step: {loss}")
+
+# The original 'model' object is NOT updated. 
+# 'optimizer' now holds the updated state.
+# Access updated model parameters via optimizer.target
+print(f"Kernel shape of linear1 in updated model: {optimizer.target.linear1.kernel.value.shape}") 
+```
+
+In this example:
+1.  We define a standard `nnx.Module` (`SimpleMLP`).
+2.  We define a `loss_fn` that takes the `model` instance directly.
+3.  We use `nnx.jit` to decorate `train_step` and `nnx.value_and_grad` to compute gradients.
+4.  **Crucially, we don't manually call `nnx.split` or `nnx.merge`.** The lifted transforms handle this automatically.
+5.  `nnx.jit` intercepts the call, splits the `optimizer` and `model` arguments into their static `GraphDef` and dynamic `State`, traces a pure function operating on the `State`, compiles it with `jax.jit`, executes it, and merges the resulting state back into new `optimizer` and `model` objects (though we only capture the updated `optimizer` here, which implicitly contains the updated `model`).
+6.  `nnx.value_and_grad` works similarly, splitting the model, creating a pure version of `loss_fn` operating on state, applying `jax.value_and_grad` to the pure function, and returning the loss and the gradients structured as a `State` object containing `VariableState` leaves.
+
+This demonstrates the primary benefit: applying JAX transformations with an object-oriented feel, significantly simplifying the boilerplate code for state management.
+
+## Key Concepts
+
+### 1. Automatic State Management (`split`/`merge`)
+
+The core mechanism behind all NNX lifted transforms is the automatic handling of state separation and recombination:
+
+*   **Input Splitting:** When a lifted transform wrapper is called, it intercepts the arguments. For any argument that is an `nnx.Module` (or other NNX graph node like `nnx.Optimizer`, `nnx.Rngs`), it internally calls `nnx.split`. This separates the object into its static `GraphDef` (structure, types) and dynamic `State` (variable values). Non-NNX arguments (like JAX arrays) are passed through as is.
+*   **Pure Function Execution:** The lifted transform constructs a temporary *pure function*. This function accepts the dynamic `State` (and any non-NNX arguments) as input. Inside this pure function, it uses `nnx.merge` to reconstruct the `nnx.Module` instance(s) from their `GraphDef`s and the input `State`. It then calls the original user function/method (e.g., `loss_fn` or `model.__call__`) on the reconstructed objects.
+*   **JAX Transformation Application:** The underlying JAX transformation (e.g., `jax.jit`, `jax.grad`) is applied to this *pure function*. JAX traces and compiles/differentiates/vectorizes the operations on the `State` pytree.
+*   **Output Merging:** The pure function returns the results, potentially including updated `State`. The lifted transform wrapper takes the output `State` and merges it with the corresponding `GraphDef` to produce the final stateful `nnx.Module` (or `nnx.Optimizer`, etc.) objects that are returned to the user. State updates happen implicitly.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant LiftedFn as nnx.jit(train_step)
+    participant SplitMerge as NNX Split/Merge
+    participant PureFn as Wrapped Pure train_step
+    participant JaxT as jax.jit
+
+    User->>LiftedFn: train_step(optimizer, model, x, y)
+    activate LiftedFn
+    LiftedFn->>SplitMerge: split(optimizer)
+    SplitMerge-->>LiftedFn: (opt_graphdef, opt_state)
+    LiftedFn->>SplitMerge: split(model)
+    SplitMerge-->>LiftedFn: (model_graphdef, model_state)
+    LiftedFn->>JaxT: jax.jit(PureFn)(opt_state, model_state, x, y)
+    activate JaxT
+    JaxT->>PureFn: Call PureFn(opt_state, model_state, x, y)
+    activate PureFn
+    PureFn->>SplitMerge: merge(opt_graphdef, opt_state)
+    SplitMerge-->>PureFn: Reconstructed Optimizer (inner_opt)
+    PureFn->>SplitMerge: merge(model_graphdef, model_state)
+    SplitMerge-->>PureFn: Reconstructed Model (inner_model)
+    PureFn->>PureFn: Execute original train_step logic (loss_fn, grad, optimizer.update) on inner_opt, inner_model
+    PureFn->>SplitMerge: split(updated inner_opt)
+    SplitMerge-->>PureFn: (opt_graphdef, updated_opt_state)
+    PureFn->>JaxT: Return (loss, updated_opt_state)
+    deactivate PureFn
+    JaxT-->>LiftedFn: Return (loss, updated_opt_state)
+    deactivate JaxT
+    LiftedFn->>SplitMerge: merge(opt_graphdef, updated_opt_state)
+    SplitMerge-->>LiftedFn: Updated Optimizer (outer_opt)
+    LiftedFn-->>User: Return (loss, outer_opt)
+    deactivate LiftedFn
+```
+*Note: The actual implementation might optimize this flow, but this illustrates the conceptual steps.*
+
+### 2. Purity and Side Effects
+
+Because the underlying JAX transformations operate on pure functions derived from your methods, you must adhere to JAX's purity rules within the transformed code:
+*   **No External Side Effects:** Don't modify global state, print inside JIT-compiled functions (use `jax.debug.print` instead), or perform I/O.
+*   **State Updates via Return:** State modifications (like parameter updates, BatchNorm statistics updates, RNG key consumption) must be reflected in the `State` returned by the pure function. Lifted transforms handle this by ensuring the pure function receives the input state and returns the output state.
+
+### 3. Supported JAX Transforms
+
+NNX provides lifted versions for common JAX transforms:
+
+*   **Compilation:**
+    *   `nnx.jit`: Lifts `jax.jit`. Compiles a function for faster execution. (See `flax/nnx/transforms/compilation.py`)
+*   **Automatic Differentiation:**
+    *   `nnx.grad`: Lifts `jax.grad`. Computes gradients. (See `flax/nnx/transforms/autodiff.py`)
+    *   `nnx.value_and_grad`: Lifts `jax.value_and_grad`. Computes function value and gradients. (See `flax/nnx/transforms/autodiff.py`)
+    *   `nnx.custom_vjp`: Lifts `jax.custom_vjp`. Defines custom vector-Jacobian products. (See `flax/nnx/transforms/autodiff.py`)
+*   **Vectorization / Parallelization:**
+    *   `nnx.vmap`: Lifts `jax.vmap`. Vectorizes functions. (See `flax/nnx/transforms/iteration.py`)
+    *   `nnx.pmap`: Lifts `jax.pmap`. Parallelizes functions across multiple devices (deprecated in favor of `shard_map`). (See `flax/nnx/transforms/iteration.py`)
+    *   `nnx.shard_map`: Lifts `jax.experimental.shard_map.shard_map`. Maps functions over data shards on a mesh. (See `flax/nnx/transforms/compilation.py`)
+*   **Control Flow:**
+    *   `nnx.scan`: Lifts `jax.lax.scan`. Scans a function over a sequence (e.g., for RNNs). (See `flax/nnx/transforms/iteration.py`)
+    *   `nnx.cond`: Lifts `jax.lax.cond`. Conditional execution. (See `flax/nnx/transforms/transforms.py`)
+    *   `nnx.switch`: Lifts `jax.lax.switch`. Multi-way conditional. (See `flax/nnx/transforms/transforms.py`)
+    *   `nnx.while_loop`: Lifts `jax.lax.while_loop`. Conditional looping. (See `flax/nnx/transforms/iteration.py`)
+    *   `nnx.fori_loop`: Lifts `jax.lax.fori_loop`. Indexed looping. (See `flax/nnx/transforms/iteration.py`)
+*   **Debugging / Analysis:**
+    *   `nnx.eval_shape`: Lifts `jax.eval_shape`. Computes output shapes/dtypes without execution. (See `flax/nnx/transforms/transforms.py`)
+    *   `nnx.checkify`: Lifts `jax.experimental.checkify.checkify`. Adds runtime error checking. (See `flax/nnx/transforms/transforms.py`)
+*   **Optimization:**
+    *   `nnx.remat`: Lifts `jax.checkpoint` (aka `jax.remat`). Gradient checkpointing for memory optimization. (See `flax/nnx/transforms/autodiff.py`)
+
+## Detailed Examples
+
+### `nnx.jit`
+
+JIT compilation is essential for performance in JAX. `nnx.jit` makes it easy to apply to methods that operate on or modify `nnx.Module` state.
+
+```python
+class Counter(nnx.Module):
+  def __init__(self):
+    self.count = nnx.Variable(0)
+
+  def increment(self, amount: int = 1):
+    self.count.value += amount
+    # NOTE: In NNX, methods don't return self by default.
+    # nnx.jit wraps the function to handle state updates.
+
+counter = Counter()
+
+# Define a jitted increment function
+# It takes the counter, performs the increment, and returns the updated counter
+@nnx.jit
+def jitted_increment(c: Counter, amount: int) -> Counter:
+    c.increment(amount)
+    # The updated state of 'c' is implicitly captured and returned
+    # We need to return 'c' explicitly if we want the updated object back
+    return c
+
+# Call the jitted function
+# Returns a NEW Counter instance with the updated state
+updated_counter = jitted_increment(counter, 5) 
+
+print(f"Original counter value: {counter.count.value}")       # Output: 0
+print(f"Updated counter value: {updated_counter.count.value}") # Output: 5 
+```
+Key takeaway: `nnx.jit` (like other lifted transforms) returns *new* instances with the updated state. The original objects passed as arguments remain unchanged.
+
+### `nnx.grad` and `nnx.value_and_grad`
+
+These are crucial for training.
+
+*   **Default Behavior:** By default, they compute gradients with respect to all `nnx.Param` variables found in the specified input arguments (via `argnums`).
+*   **Customizing Gradients with `nnx.DiffState`:** You can precisely control what to differentiate using `nnx.DiffState(argnum, filter)`. The `filter` uses the [Filter (`filterlib`)](filters___filterlib__.mdc) syntax.
+
+```python
+class ModelWithStats(nnx.Module):
+  def __init__(self, *, rngs: nnx.Rngs):
+    self.linear = nnx.Linear(2, 2, rngs=rngs)
+    # Add a non-parameter variable
+    self.stats = nnx.Variable(jnp.zeros(2)) 
+
+  def __call__(self, x):
+    # Update stats based on input mean (example mutation)
+    self.stats.value = (self.stats.value + jnp.mean(x, axis=0)) / 2.0 
+    return self.linear(x) + self.stats.value
+
+model_ws = ModelWithStats(rngs=nnx.Rngs(1))
+x = jnp.ones((4, 2))
+
+def loss_simple(m: ModelWithStats, x):
+    return jnp.mean(m(x)**2)
+
+# --- Default: Grad w.r.t. nnx.Param ---
+value, grads_params = nnx.value_and_grad(loss_simple)(model_ws, x)
+print("Grads (Params only):\n", grads_params) 
+# Output shows State containing only kernel/bias VariableState
+
+# --- Grad w.r.t. specific filter (only 'bias') ---
+bias_filter = nnx.All(nnx.Param, nnx.PathContains('bias'))
+diff_bias = nnx.DiffState(0, bias_filter)
+value, grads_bias = nnx.value_and_grad(loss_simple, argnums=diff_bias)(model_ws, x)
+print("\nGrads (Bias only):\n", grads_bias) 
+# Output shows State containing only bias VariableState
+
+# --- Grad w.r.t. non-Param ('stats') ---
+stats_filter = nnx.Variable # Filter for the 'stats' Variable
+diff_stats = nnx.DiffState(0, stats_filter) 
+value, grads_stats = nnx.value_and_grad(loss_simple, argnums=diff_stats)(model_ws, x)
+print("\nGrads (Stats only):\n", grads_stats)
+# Output shows State containing only stats VariableState
+```
+The gradients are returned as a `State` object mirroring the structure of the differentiated argument, containing `VariableState` leaves only for the variables matching the filter.
+
+*   **`has_aux`:** Just like `jax.grad`, you can use `has_aux=True` if your function returns auxiliary data alongside the loss.
+
+```python
+def loss_with_aux(m: ModelWithStats, x):
+    y_pred = m(x)
+    loss = jnp.mean(y_pred**2)
+    # Return loss and prediction as auxiliary data
+    return loss, y_pred 
+
+grad_fn_aux = nnx.grad(loss_with_aux, has_aux=True)
+# Returns (grads, (aux_data, updated_model))
+grads, (y_pred_out, updated_model) = grad_fn_aux(model_ws, x) 
+
+print(f"\nAuxiliary output shape: {y_pred_out.shape}")
+# Output: Auxiliary output shape: (4, 2)
+```
+
+### `nnx.vmap`
+
+Vectorizes functions. `nnx.vmap` needs to know how to handle the state variables within `nnx.Module` arguments across the mapped dimension.
+
+*   **`in_axes` / `out_axes`:** Specify the mapped axis for standard JAX arrays and containers.
+*   **`nnx.StateAxes`:** For `nnx.Module` arguments, use `nnx.StateAxes` within `in_axes`/`out_axes` to specify behavior per variable type or filter.
+    *   `{filter: integer}`: Map the state variable along the specified axis.
+    *   `{filter: None}`: Broadcast the state variable (use the same value for all mapped instances).
+    *   `{filter: nnx.Carry}`: Currently unsupported in `nnx.vmap`, used in `nnx.scan`.
+
+```python
+class VmapModel(nnx.Module):
+    def __init__(self, *, rngs: nnx.Rngs):
+        self.shared_param = nnx.Param(jnp.ones(3))
+        self.mapped_stat = nnx.BatchStat(jnp.arange(5 * 3).reshape((5, 3))) # Has batch dim 5
+
+    def __call__(self, x):
+        # x has batch dim 5
+        # shared_param is broadcasted
+        # mapped_stat has batch dim 5 matching x
+        return x * self.shared_param.value + self.mapped_stat.value
+
+vmodel = VmapModel(rngs=nnx.Rngs(0))
+x_batch = jnp.ones((5, 3)) # Batch dimension = 5
+
+# Define state handling: map BatchStat along axis 0, broadcast Param
+state_axes = nnx.StateAxes({nnx.Param: None, nnx.BatchStat: 0})
+
+# vmap the __call__ method
+# Pass state_axes for the model (arg 0), map x along axis 0
+vmapped_call = nnx.vmap(
+    VmapModel.__call__, 
+    in_axes=(state_axes, 0), 
+    out_axes=0 # Map output along axis 0
+)
+
+# Call the vmapped function
+y_batch = vmapped_call(vmodel, x_batch)
+
+print(f"Vmapped output shape: {y_batch.shape}") 
+# Output: Vmapped output shape: (5, 3)
+```
+
+### `nnx.scan`
+
+Used for sequential operations, like in RNNs. It requires managing a "carry" state that is passed between iterations.
+
+*   **`in_axes` / `out_axes`:** Specify mapping for inputs/outputs that are scanned over (axis 0) or broadcast (`None`). For the carry argument/output, use `nnx.Carry`.
+*   **`nnx.Carry`:** A special marker used in `in_axes`/`out_axes` to designate the carry argument/output.
+*   **Function Signature:** The function passed to `nnx.scan` should have the signature `(carry, x) -> (new_carry, y)`, where `carry` is the state from the previous step (or initial carry) and `x` is the current element from the scanned sequence. `new_carry` is the updated state passed to the next step, and `y` is the output for the current step.
+
+```python
+class SimpleRNNCell(nnx.Module):
+  def __init__(self, features: int, *, rngs: nnx.Rngs):
+    self.dense_h = nnx.Linear(features, features, rngs=rngs)
+    self.dense_x = nnx.Linear(features, features, rngs=rngs)
+
+  def __call__(self, carry_h: jax.Array, x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    # Simple RNN update: h_new = tanh(Wx*x + Wh*h + b)
+    new_h = nnx.tanh(self.dense_x(x) + self.dense_h(carry_h))
+    # Output is the new hidden state (which is also the carry)
+    return new_h, new_h 
+
+cell = SimpleRNNCell(features=10, rngs=nnx.Rngs(0))
+xs_sequence = jnp.ones((5, 10)) # Sequence length 5
+initial_carry = jnp.zeros(10)   # Initial hidden state
+
+# Scan the cell over the input sequence
+# Carry: cell (module state) and initial_carry (hidden state)
+# Scanned input: xs_sequence
+scan_fn = nnx.scan(
+    SimpleRNNCell.__call__,
+    in_axes=(nnx.Carry, 0), # cell is Carry, xs_sequence is scanned (axis 0)
+    out_axes=(nnx.Carry, 0),# final_carry is Carry, ys_sequence is scanned (axis 0)
+    length=5 # Specify sequence length
+)
+
+# scan returns (final_carry, stacked_outputs)
+(final_carry_cell, final_h), ys_sequence = scan_fn(cell, initial_carry, xs_sequence)
+
+print(f"Final hidden state shape: {final_h.shape}")
+print(f"Output sequence shape: {ys_sequence.shape}")
+# Output: Final hidden state shape: (10,)
+# Output: Output sequence shape: (5, 10)
+```
+Note how the `cell` (containing parameters) and the `initial_carry` (hidden state) are conceptually part of the carry. `nnx.scan` handles the `cell`'s state implicitly via `nnx.Carry` in `in_axes`/`out_axes`, while the JAX array `initial_carry` is handled explicitly.
+
+## Internal Implementation Insights
+
+Lifted transforms generally follow a common pattern implemented using helper functions primarily in `flax.nnx.extract` and `flax.nnx.transforms.general`.
+
+**General Wrapper Structure:**
+
+1.  **`@graph.update_context(transform_name)`:** Sets up a context to track reference updates specifically for this transform instance.
+2.  **Resolve Kwargs:** (If necessary) Convert keyword arguments to positional arguments using `resolve_kwargs`.
+3.  **`extract.to_tree(...)`:**
+    *   Takes the input arguments (`args`, `kwargs`) and potentially `prefix` information (like `in_axes` for `vmap` or `DiffState` filters for `grad`).
+    *   Uses a transform-specific `split_fn` (e.g., `_jit_split_fn`, `_grad_split_fn`, `_vmap_split_fn`).
+    *   The `split_fn` calls `ctx.split` or `ctx.flatten` which traverses the arguments.
+    *   When an `nnx.Module` or `Variable` is encountered, `ctx.split` separates it into `GraphDef` and `State` based on the provided filters or default behavior. Non-NNX nodes are treated as leaves.
+    *   Returns a pure JAX pytree (`pure_args`, `pure_kwargs`) where NNX objects are replaced by `extract.NodeStates` containers holding their `GraphDef` and partitioned `State`.
+4.  **Define Wrapped Pure Function:** Create a function (e.g., `JitFn`, `GradFn`, `VmapFn`) that will be passed to the underlying JAX transform.
+    *   This function takes the pure JAX pytree arguments.
+    *   It calls `extract.from_tree(...)` with a `merge_fn` (e.g., `_jit_merge_fn`).
+    *   The `merge_fn` calls `ctx.merge` or `ctx.unflatten` which uses the `GraphDef` and `State` from the input `NodeStates` to reconstruct the stateful `nnx.Module` instances *inside* the pure function's scope.
+    *   It then calls the original user function (`f`) with the reconstructed objects.
+    *   It takes the output of `f`, potentially clears non-graph nodes (`extract.clear_non_graph_nodes`), and calls `extract.to_tree(...)` again to split the outputs back into `GraphDef` and `State` (`pure_out`).
+    *   Returns the pure output pytree.
+5.  **Call Underlying JAX Transform:** Apply the corresponding `jax.*` transform (e.g., `jax.jit`, `jax.grad`) to the wrapped pure function, passing the `pure_args`, `pure_kwargs`. JAX traces/compiles/differentiates this pure function operating on `State`.
+6.  **`extract.from_tree(...)` (Outer):**
+    *   Takes the pure output pytree returned by the JAX transform.
+    *   Uses the appropriate `merge_fn`.
+    *   Reconstructs the final stateful `nnx.Module` instances from the output `GraphDef` and `State`.
+    *   Returns the final result to the user.
+
+**`nnx.jit` Example Walkthrough:**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant JitWrapper as nnx.jit(wrapper)
+    participant Extract as extract.(to/from)_tree
+    participant JitFn as Wrapped Pure Function
+    participant JaxJit as jax.jit
+    participant Module as nnx.Module Instance
+
+    User->>JitWrapper: Call jitted_function(module_instance, x)
+    activate JitWrapper
+    JitWrapper->>Extract: to_tree((module_instance, x), split_fn=_jit_split_fn)
+    activate Extract
+    Extract->>Module: split(module_instance)
+    Extract-->>JitWrapper: Return (pure_module_state, x)
+    deactivate Extract
+    JitWrapper->>JaxJit: jax.jit(JitFn)(pure_module_state, x)
+    activate JaxJit
+    JaxJit->>JitFn: Call JitFn(pure_module_state, x)
+    activate JitFn
+    JitFn->>Extract: from_tree((pure_module_state, x), merge_fn=_jit_merge_fn)
+    activate Extract
+    Extract->>Module: merge(graphdef, state)
+    Extract-->>JitFn: Return (reconstructed_module, x)
+    deactivate Extract
+    JitFn->>JitFn: Execute original_function(reconstructed_module, x) -> updated_module, y
+    JitFn->>Extract: to_tree((updated_module, y))
+    activate Extract
+    Extract-->>JitFn: Return (pure_updated_state, y)
+    deactivate Extract
+    JitFn-->>JaxJit: Return (pure_updated_state, y)
+    deactivate JitFn
+    JaxJit-->>JitWrapper: Return (pure_updated_state, y)
+    deactivate JaxJit
+    JitWrapper->>Extract: from_tree((pure_updated_state, y), merge_fn=_jit_merge_fn)
+    activate Extract
+    Extract-->>JitWrapper: Return (final_updated_module, y)
+    deactivate Extract
+    JitWrapper-->>User: Return (final_updated_module, y)
+    deactivate JitWrapper
+```
+
+**Code References:**
+
+*   `flax/nnx/transforms/`: Contains the implementation for specific lifted transforms (`autodiff.py`, `compilation.py`, `iteration.py`, `transforms.py`).
+    *   Look for functions like `_grad_general`, `jit`, `vmap`, `scan`.
+    *   Notice the pattern of defining a wrapper class (`JitFn`, `GradFn`, `VmapFn`, `ScanFn`) passed to the underlying JAX transform.
+*   `flax/nnx/transforms/general.py`: Contains helpers like `split_inputs`, `merge_inputs` used by some transforms.
+*   `flax/nnx/extract.py`: Core logic for `to_tree` and `from_tree` which handle the split/merge based on context (`SplitContext`, `MergeContext`) and provided functions (`split_fn`, `merge_fn`). `NodeStates` is defined here.
+*   `flax/nnx/graph.py`: `update_context` decorator manages the context stack for reference tracking within transforms.
+
+The implementations cleverly use JAX's pytree registration for `NodeStates` and the context managers to ensure state is correctly handled and references are updated appropriately across the functional boundary imposed by JAX transformations.
+
+## Conclusion
+
+NNX Lifted Transforms provide a powerful and convenient bridge between the object-oriented world of `nnx.Module` and the functional world of JAX transformations. By automatically managing the splitting of modules into static structure (`GraphDef`) and dynamic state (`State`), applying the underlying JAX transform to a pure function, and merging the results, they allow developers to leverage JAX's performance and capabilities (`jit`, `grad`, `vmap`, `scan`, etc.) with significantly reduced boilerplate code compared to manual state management. Understanding how they work internally via `split`/`merge` and how to control state handling using filters (`DiffState`, `StateAxes`) is key to effectively using NNX for complex models and training procedures.
+
+While lifted transforms cover many common use cases, sometimes you need finer-grained manual control over the state. In the next chapter, we will explore the [NNX Functional API (split/merge/state/update/graphdef)](nnx_functional_api__split_merge_state_update_graphdef_.mdc) which provides the building blocks used by these lifted transforms.
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

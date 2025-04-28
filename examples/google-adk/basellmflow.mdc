@@ -1,0 +1,298 @@
+---
+description: Details google-adk's BaseLlmFlow, the core engine orchestrating LLM interactions, processors, tool calls, and agent transfers for LlmAgent.
+globs: src/google/adk/flows/llm_flows/base_llm_flow.py
+alwaysApply: false
+---
+# Chapter 8: BaseLlmFlow
+
+In the [previous chapter](tool__basetool_.mdc), we saw how `BaseTool` allows agents to extend their capabilities beyond simple text generation. But how does the agent actually manage the conversation flow when deciding to use a tool, calling it, processing the result, and generating the final response? This chapter introduces `BaseLlmFlow`, the internal engine within an [Agent (BaseAgent / LlmAgent)](agent__baseagent___llmagent_.mdc) that orchestrates this complex interaction cycle with the underlying [BaseLlm](basellm.mdc).
+
+## Motivation and Use Case
+
+The logic required to interact effectively with an LLM, especially when tools, planning, or agent transfers are involved, can become quite complex. It often involves:
+1.  Preparing the request with appropriate history, instructions, and tool definitions.
+2.  Calling the LLM API.
+3.  Parsing the response to check for tool calls, code snippets, plan updates, or final answers.
+4.  If a tool is called, executing the tool and packaging the result.
+5.  Sending the tool result back to the LLM.
+6.  Repeating the process until a final answer is generated.
+7.  Handling potential agent transfers.
+
+Hardcoding this intricate logic directly into the `LlmAgent` class would make it monolithic and difficult to customize or extend. `BaseLlmFlow` abstracts this control flow, separating the *how* of LLM interaction from the *what* defined by the agent's configuration (instructions, tools, etc.). This allows for different interaction patterns (flows) and modular customization through processors.
+
+**Central Use Case:** An `LlmAgent` equipped with a `search_tool` receives the query "What's new with Project IDX?".
+*   The `LlmAgent` internally uses an instance of `BaseLlmFlow` (likely `AutoFlow` because it handles tools).
+*   The `BaseLlmFlow` prepares the request, adding the `search_tool` definition.
+*   It calls the [BaseLlm](basellm.mdc).
+*   The LLM responds with a request to call `search_tool(query="Project IDX news")`.
+*   The `BaseLlmFlow` parses this, identifies the `search_tool` [Tool (BaseTool)](tool__basetool_.mdc), executes it, and gets the search results.
+*   It formats the results as a `FunctionResponse` and adds it to the history.
+*   It calls the LLM *again* with the updated history including the search results.
+*   The LLM now generates a summary based on the search results.
+*   The `BaseLlmFlow` receives this final text response and yields the corresponding [Event](event.mdc).
+The `BaseLlmFlow` managed the entire multi-step interaction loop with the LLM and the tool.
+
+## Key Concepts
+
+*   **`BaseLlmFlow` (Abstract Base Class):**
+    *   **Purpose:** Defines the abstract interface and core orchestration logic for managing an LLM interaction cycle within a single agent turn.
+    *   **Core Methods:** `run_async` (standard interaction loop), `run_live` (for real-time streaming connections).
+    *   **Orchestration Loop:** The primary responsibility is to manage the sequence: prepare request -> call LLM -> process response -> loop if necessary (e.g., after tool call).
+    *   **Processors:** Manages lists of `BaseLlmRequestProcessor` and `BaseLlmResponseProcessor` instances.
+
+*   **`BaseLlmRequestProcessor` (Interface):** <a id="basellmrequestprocessor"></a>
+    *   **Purpose:** Defines an interface (`run_async`) for components that modify the `LlmRequest` *before* it's sent to the LLM.
+    *   **Use Cases:** Adding instructions, filtering/transforming history, injecting planner state, declaring tools, handling agent transfer declarations.
+    *   **Modularity:** Allows adding or removing pre-processing steps without altering the core flow logic.
+
+*   **`BaseLlmResponseProcessor` (Interface):** <a id="basellmresponseprocessor"></a>
+    *   **Purpose:** Defines an interface (`run_async`) for components that process the `LlmResponse` *after* it's received from the LLM, potentially yielding intermediate events or modifying the response before the main flow logic handles it.
+    *   **Use Cases:** Handling code execution requests, extracting/updating planner state, logging/analyzing responses.
+    *   **Modularity:** Enables adding post-processing steps independently.
+
+*   **Concrete Implementations:**
+    *   **`SingleFlow`:** <a id="singleflow"></a> Handles basic LLM calls, tool invocation (function calling), planning, and code execution via processors. It does *not* handle agent transfer logic. Used when an agent cannot transfer control (e.g., `disallow_transfer_to_parent=True`, `disallow_transfer_to_peers=True`, and no `sub_agents`).
+    *   **`AutoFlow`:** <a id="autoflow"></a> Inherits from `SingleFlow` and adds a `BaseLlmRequestProcessor` (`agent_transfer.request_processor`) to handle the logic for declaring potential agent transfers (to parent, peers, sub-agents) to the LLM. This is the default flow used by `LlmAgent` unless transfers are explicitly disabled.
+
+*   **Separation of Concerns:** `BaseLlmFlow` cleanly separates the control flow logic (the interaction loop, processor management, tool execution triggering) from the agent's definition and the specific LLM backend details.
+
+## How to Use `BaseLlmFlow`
+
+Developers typically **do not interact directly** with `BaseLlmFlow` instances. Instead, the [Agent (BaseAgent / LlmAgent)](agent__baseagent___llmagent_.mdc) automatically selects and uses the appropriate flow internally based on its configuration.
+
+1.  **Implicit Selection by `LlmAgent`:**
+    The `LlmAgent` has an internal property `_llm_flow` that determines which flow instance to use.
+
+    ```python
+    # Simplified from src/google/adk/agents/llm_agent.py
+    class LlmAgent(BaseAgent):
+        # ... other attributes (model, instruction, tools, sub_agents) ...
+        disallow_transfer_to_parent: bool = False
+        disallow_transfer_to_peers: bool = False
+        sub_agents: list[BaseAgent] = Field(default_factory=list)
+
+        @property
+        def _llm_flow(self) -> BaseLlmFlow:
+            # If transfers are fully disallowed and no sub-agents exist...
+            if (
+                self.disallow_transfer_to_parent
+                and self.disallow_transfer_to_peers
+                and not self.sub_agents
+            ):
+                # Use the simpler flow without agent transfer logic
+                return SingleFlow()
+            else:
+                # Use the flow that includes agent transfer capabilities
+                return AutoFlow()
+
+        @override
+        async def _run_async_impl(
+            self, ctx: InvocationContext
+        ) -> AsyncGenerator[Event, None]:
+            # Delegate the actual LLM interaction loop to the selected flow
+            async for event in self._llm_flow.run_async(ctx):
+                # ... potentially save output to state ...
+                yield event
+    ```
+    *Technical Explanation:* The `LlmAgent` checks its configuration (`disallow_transfer_to_parent`, `disallow_transfer_to_peers`, `sub_agents`). If agent transfers are impossible based on these flags, it selects `SingleFlow`. Otherwise, it selects `AutoFlow`, which includes the necessary processors to handle potential agent transfers. The agent's `_run_async_impl` then simply delegates the execution to the selected flow's `run_async` method.
+
+2.  **Customizing via Processors (Advanced):**
+    While direct interaction is rare, one could potentially create custom `BaseLlmFlow` subclasses or modify the processor lists of existing flows for highly specialized interaction patterns, though this is generally not required for typical use cases.
+
+## Internal Implementation
+
+The core logic resides in `BaseLlmFlow`'s `run_async` method (and helper methods like `_preprocess_async`, `_call_llm_async`, `_postprocess_async`).
+
+**High-Level Flow (`run_async` Loop):**
+
+A single turn (one call to `agent.run_async`) might involve multiple iterations of the internal flow loop, especially if tools are used.
+
+1.  **Loop Start:** The flow enters a loop that continues until a final response is generated or the invocation is explicitly ended (e.g., by agent transfer).
+2.  **Pre-process (`_preprocess_async`):**
+    *   Creates an `LlmRequest` object.
+    *   Iterates through all registered `BaseLlmRequestProcessor` instances.
+    *   Each processor modifies the `LlmRequest` (e.g., adding instructions, history, tool declarations, agent transfer info). Processors can also yield preliminary events.
+3.  **Call LLM (`_call_llm_async`):**
+    *   Handles the agent's `before_model_callback`.
+    *   Calls the `generate_content_async` method on the resolved [BaseLlm](basellm.mdc) instance, passing the prepared `LlmRequest`. Handles streaming if configured.
+    *   Handles the agent's `after_model_callback`.
+    *   Yields `LlmResponse` objects (potentially partial/streamed).
+4.  **Post-process (`_postprocess_async`):**
+    *   Receives each `LlmResponse` from the LLM call.
+    *   Iterates through all registered `BaseLlmResponseProcessor` instances.
+    *   Each processor inspects/modifies the response or performs actions (e.g., triggers code execution), potentially yielding events.
+    *   Finalizes the `LlmResponse` into an `Event` object.
+    *   Yields the final `Event` for this LLM response chunk.
+    *   **Handles Function Calls:** If the yielded event contains `FunctionCall` parts, it calls `functions.handle_function_calls_async`.
+        *   This finds the corresponding [Tool (BaseTool)](tool__basetool_.mdc).
+        *   Handles `before/after_tool_callback`.
+        *   Calls the tool's `run_async` method.
+        *   Packages the result into a `FunctionResponse` [Event](event.mdc) (including any state changes from the tool).
+        *   Yields the `FunctionResponse` event.
+        *   If the function call was an agent transfer, it finds and runs the target agent, potentially ending the current flow's loop.
+5.  **Loop Continuation:** If the last event yielded was *not* a final response (e.g., it was a tool call/response event or an intermediate thought from a planner), the flow loops back to Step 2 to prepare the next request to the LLM (now including the tool response in the history).
+6.  **Loop End:** The loop terminates when a final response event (an event where `is_final_response()` is true) is yielded, or when an agent transfer occurs and successfully passes control.
+
+**Sequence Diagram (`run_async` with Tool Call):**
+
+```mermaid
+sequenceDiagram
+    participant LlmAgent
+    participant Flow as BaseLlmFlow
+    participant ReqProc as RequestProcessor
+    participant LLM as BaseLlm
+    participant RespProc as ResponseProcessor
+    participant FuncHandler as functions.handle_function_calls_async
+    participant Tool as BaseTool
+
+    LlmAgent->>+Flow: run_async(invocation_context)
+    loop Until Final Response or Transfer
+        Flow->>Flow: Create LlmRequest
+        Flow->>+ReqProc: run_async(ctx, request)
+        ReqProc-->>-Flow: (Modifies request)
+        Flow->>+LLM: generate_content_async(request)
+        LLM-->>-Flow: yield llm_response_chunk
+        Flow->>+RespProc: run_async(ctx, response_chunk)
+        RespProc-->>-Flow: (Processes response, maybe yields events)
+        Flow->>Flow: Finalize Event from llm_response_chunk
+        alt Event contains FunctionCall
+            Flow->>+FuncHandler: handle_function_calls_async(ctx, event, tools)
+            FuncHandler->>+Tool: run_async(args, tool_context)
+            Tool-->>-FuncHandler: tool_result
+            FuncHandler->>FuncHandler: Create FunctionResponse Event (with state delta)
+            FuncHandler-->>-Flow: function_response_event
+            Flow-->>LlmAgent: yield function_response_event
+            Note over Flow: History now includes tool response, loop continues
+        else Event is Final Response
+            Flow-->>LlmAgent: yield final_event
+            Note over Flow: Loop breaks
+        else Intermediate Event (e.g., Planner thought)
+            Flow-->>LlmAgent: yield intermediate_event
+            Note over Flow: Loop continues
+        end
+    end
+    Flow-->>-LlmAgent: (run_async completes)
+
+```
+
+**Code Snippets:**
+
+*   `BaseLlmFlow` Orchestration (`src/google/adk/flows/llm_flows/base_llm_flow.py`):
+    ```python
+    # Simplified from BaseLlmFlow.run_async
+    async def run_async(
+        self, invocation_context: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        while True:
+            last_event = None
+            # Calls _preprocess_async, _call_llm_async, _postprocess_async
+            async for event in self._run_one_step_async(invocation_context):
+                last_event = event
+                yield event
+            # Break if the last event was final or transfer occurred implicitly
+            if not last_event or last_event.is_final_response():
+                break # Exit the loop
+
+    async def _run_one_step_async(
+        self, invocation_context: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        llm_request = LlmRequest()
+        # 1. Preprocess Request
+        async for event in self._preprocess_async(invocation_context, llm_request):
+            yield event
+        # ... check ctx.end_invocation ...
+
+        model_response_event = Event(...) # Prepare event shell
+        # 2. Call LLM (yields multiple LlmResponse chunks)
+        async for llm_response in self._call_llm_async(
+            invocation_context, llm_request, model_response_event
+        ):
+            # 3. Postprocess Response (yields Events)
+            async for event in self._postprocess_async(
+                invocation_context, llm_request, llm_response, model_response_event
+            ):
+                yield event # Includes final answer AND function call handling
+    ```
+    *Technical Explanation:* `run_async` implements the main loop, checking `last_event.is_final_response()` to decide whether to continue. `_run_one_step_async` orchestrates the call to the preprocess, LLM call, and postprocess helper methods for a single LLM interaction cycle.
+
+*   Processor Execution (`src/google/adk/flows/llm_flows/base_llm_flow.py`):
+    ```python
+    # Simplified from BaseLlmFlow._preprocess_async
+    async def _preprocess_async(
+        self, invocation_context: InvocationContext, llm_request: LlmRequest
+    ) -> AsyncGenerator[Event, None]:
+        # ... setup ...
+        # Runs registered request processors
+        for processor in self.request_processors:
+            async for event in processor.run_async(invocation_context, llm_request):
+                yield event # Processors can yield events too
+        # Also processes tool declarations here...
+
+    # Simplified from BaseLlmFlow._postprocess_async
+    async def _postprocess_async(
+        self, invocation_context: InvocationContext, llm_request: LlmRequest,
+        llm_response: LlmResponse, model_response_event: Event
+    ) -> AsyncGenerator[Event, None]:
+        # Runs registered response processors
+        async for event in self._postprocess_run_processors_async(
+            invocation_context, llm_response
+        ):
+            yield event
+        # ... finalize model response event ...
+        yield model_response_event # Yield the main model response event
+        # Handles function calls if present in model_response_event
+        if model_response_event.get_function_calls():
+            async for event in self._postprocess_handle_function_calls_async(
+                invocation_context, model_response_event, llm_request
+            ):
+                yield event # Yield FunctionResponse events
+    ```
+    *Technical Explanation:* `_preprocess_async` shows the iteration over `self.request_processors`, allowing each to modify the `llm_request`. `_postprocess_async` similarly iterates over `self.response_processors` and then explicitly calls the function handling logic (`_postprocess_handle_function_calls_async`, which uses `functions.py`) if the LLM response included function calls.
+
+*   `SingleFlow` Initialization (`src/google/adk/flows/llm_flows/single_flow.py`):
+    ```python
+    # Simplified from SingleFlow.__init__
+    class SingleFlow(BaseLlmFlow):
+        def __init__(self):
+            super().__init__()
+            # Adds processors for basic instructions, content handling,
+            # planning, code execution, etc.
+            self.request_processors += [
+                basic.request_processor,
+                auth_preprocessor.request_processor,
+                instructions.request_processor,
+                identity.request_processor,
+                contents.request_processor,
+                _nl_planning.request_processor,
+                _code_execution.request_processor,
+            ]
+            self.response_processors += [
+                _nl_planning.response_processor,
+                _code_execution.response_processor,
+            ]
+    ```
+    *Technical Explanation:* `SingleFlow` inherits `BaseLlmFlow` and populates its `request_processors` and `response_processors` lists with the standard set needed for handling instructions, history, tools, planning, and code execution.
+
+*   `AutoFlow` Initialization (`src/google/adk/flows/llm_flows/auto_flow.py`):
+    ```python
+    # Simplified from AutoFlow.__init__
+    from . import agent_transfer
+
+    class AutoFlow(SingleFlow):
+        def __init__(self):
+            super().__init__() # Get all processors from SingleFlow
+            # Add the specific processor for handling agent transfer logic
+            self.request_processors += [agent_transfer.request_processor]
+    ```
+    *Technical Explanation:* `AutoFlow` inherits from `SingleFlow` (gaining all its processors) and adds one additional request processor: `agent_transfer.request_processor`. This processor is responsible for modifying the `LlmRequest` to include information and instructions necessary for the LLM to decide if and when to transfer control to another agent.
+
+## Conclusion
+
+`BaseLlmFlow` is the engine that drives LLM interactions within `google-adk`. It provides a structured and extensible way to manage the complex cycle of preparing requests, calling the LLM, processing responses, handling tools, managing plans, executing code, and potentially transferring control between agents. By leveraging request and response processors, `BaseLlmFlow` enables modular customization of the interaction logic, with `SingleFlow` providing core capabilities and `AutoFlow` extending them with agent transfer handling. Understanding this flow is key to grasping how an `LlmAgent` executes its turn.
+
+The flow heavily relies on a central object that carries all the necessary information for a single agent turn. The next chapter dives into this crucial component: the [InvocationContext](invocationcontext.mdc).
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

@@ -1,0 +1,335 @@
+---
+description: google-adk tutorial on Tool (BaseTool), the abstraction for agent capabilities like API calls, search, code execution, and interacting with external systems.
+globs: src/google/adk/tools/base_tool.py
+alwaysApply: false
+---
+# Chapter 7: Tool (BaseTool)
+
+In the [previous chapter](basellm.mdc), we explored `BaseLlm`, the abstraction enabling agents to leverage the generative power of Large Language Models. However, LLMs alone have limitations – their knowledge is often frozen in time, and they cannot directly interact with the outside world or execute specific tasks beyond text generation. This chapter introduces the `Tool` abstraction (`BaseTool`), which empowers agents to overcome these limitations by providing defined capabilities.
+
+## Motivation and Use Case
+
+Imagine an [Agent (BaseAgent / LlmAgent)](agent__baseagent___llmagent_.mdc) tasked with answering "What's the current weather in Tokyo?". Without external access, the LLM could only provide information based on its training data, which might be outdated. To provide a real-time answer, the agent needs a *capability* to fetch current weather data.
+
+Similarly, an agent might need to:
+*   Search the web for recent news ([`google_search`](src/google/adk/tools/google_search_tool.py)).
+*   Look up information in a specific database or knowledge base ([`VertexAiSearchTool`](src/google/adk/tools/vertex_ai_search_tool.py), `BaseRetrievalTool`).
+*   Execute a piece of Python code ([`built_in_code_execution`](src/google/adk/tools/built_in_code_execution_tool.py)).
+*   Interact with an external service via its API (e.g., booking a flight, managing calendar events) ([`RestApiTool`](src/google/adk/tools/openapi_tool/openapi_spec_parser/rest_api_tool.py)).
+*   Delegate a sub-task to another specialized agent ([`AgentTool`](src/google/adk/tools/agent_tool.py)).
+
+The `Tool` abstraction provides a standardized way to define, declare, and execute these diverse capabilities, making them available for the LLM to use intelligently.
+
+**Central Use Case:** A user asks an `LlmAgent`, "Find recent articles about advancements in solar panel efficiency and summarize them." The agent, equipped with a `google_search` tool, identifies the need for external information. The underlying [BaseLlmFlow](basellmflow.mdc) orchestrates the process:
+1.  The LLM generates a request to use the `google_search` tool with a query like "recent advancements solar panel efficiency".
+2.  The framework identifies the corresponding `GoogleSearchTool` instance.
+3.  The tool's logic (which might be built-in model functionality or a client-side implementation) executes the search.
+4.  The search results are returned to the LLM.
+5.  The LLM processes the results and generates the final summary for the user.
+
+## Key Concepts
+
+*   **`BaseTool` (Interface - `src/google/adk/tools/base_tool.py`):**
+    *   **Purpose:** The abstract base class defining the contract for all tools.
+    *   **Core Methods:**
+        *   `_get_declaration() -> Optional[types.FunctionDeclaration]`: Returns the tool's definition in a format the LLM understands (typically based on OpenAPI schema). This includes the tool's `name`, `description`, and expected input `parameters`. This allows the LLM to know *when* and *how* to use the tool. Returns `None` if the tool doesn't need explicit declaration (e.g., some built-in model tools).
+        *   `run_async(*, args: dict[str, Any], tool_context: ToolContext) -> Any`: Contains the actual logic to execute the tool's capability. It receives arguments (`args`) filled in by the LLM based on the declaration and the execution context ([`ToolContext`](toolcontext.mdc)) providing access to [State](state.mdc), artifacts, etc. It returns the result of the tool's execution, which is then passed back to the LLM. Must be implemented for client-side tools.
+        *   `process_llm_request(*, tool_context: ToolContext, llm_request: LlmRequest) -> None`: Allows a tool to modify the outgoing request to the [BaseLlm](basellm.mdc). The default implementation uses `_get_declaration` to add the tool's function declaration to the `llm_request.config.tools`. Some tools might override this for specialized behavior (e.g., built-in model tools like `google_search`).
+    *   **Attributes:** `name` (unique identifier used by LLM), `description` (explains what the tool does, used by LLM for selection), `is_long_running` (flag for asynchronous operations).
+
+*   **Tool Declaration:** The process of describing a tool's interface (name, description, parameters) to the LLM. `google-adk` typically uses `google.genai.types.FunctionDeclaration`, often derived from OpenAPI schemas or Python function signatures. This is crucial for the LLM's function calling capabilities.
+
+*   **Tool Execution:** The process of invoking the tool's `run_async` method with arguments provided by the LLM. The framework handles matching the LLM's function call request to the correct tool instance and executing it.
+
+*   **Concrete Implementations:** `google-adk` provides several built-in tool types:
+    *   [`FunctionTool`](src/google/adk/tools/function_tool.py): Wraps a standard Python function, automatically generating the declaration from its signature and docstring.
+    *   [`RestApiTool`](src/google/adk/tools/openapi_tool/openapi_spec_parser/rest_api_tool.py): Interacts with REST APIs defined by an OpenAPI specification. Parses the spec to create declarations and handles HTTP requests, including authentication.
+    *   [`VertexAiSearchTool`](src/google/adk/tools/vertex_ai_search_tool.py) / [`google_search`](src/google/adk/tools/google_search_tool.py): Leverage Google's search capabilities (often model-integrated).
+    *   [`AgentTool`](src/google/adk/tools/agent_tool.py): Allows one agent to invoke another agent as a tool.
+    *   `BaseRetrievalTool` ([`src/google/adk/tools/retrieval/base_retrieval_tool.py`](src/google/adk/tools/retrieval/base_retrieval_tool.py)): Base for tools retrieving information from data sources.
+    *   Integrations like `CrewaiTool`, `LangchainTool` adapt tools from other frameworks.
+
+*   **Framework Integration:**
+    *   Tools are provided to an [`LlmAgent`](agent__baseagent___llmagent_.mdc) via its `tools` list.
+    *   The agent's [`BaseLlmFlow`](basellmflow.mdc) (typically `AutoFlow`) includes the tool declarations when making requests to the [BaseLlm](basellm.mdc).
+    *   When the LLM response contains a `function_call`, the flow uses the `function_call.name` to find the corresponding `BaseTool` instance.
+    *   The flow calls the tool's `run_async` method with `function_call.args` and a [`ToolContext`](toolcontext.mdc).
+    *   The flow packages the result returned by `run_async` into a `function_response` [Event](event.mdc) and sends it back to the LLM for processing (e.g., summarization or generating the next step).
+
+## How to Use `Tool`
+
+1.  **Providing Tools to `LlmAgent`:**
+    The most common way to use tools is to add them to an `LlmAgent`'s `tools` list during initialization. You can pass `BaseTool` instances or Python functions (which will be automatically wrapped in `FunctionTool`).
+
+    ```python
+    from google.adk.agents import LlmAgent
+    from google.adk.tools import google_search, FunctionTool
+    # Assume my_custom_api_tool is a BaseTool instance
+
+    # Define a simple Python function to act as a tool
+    def get_user_name(user_id: str) -> str:
+        """Retrieves the user's name based on their ID."""
+        # In reality, this would look up the user in a database
+        print(f"Tool called: get_user_name with user_id={user_id}")
+        return f"User_{user_id}_Name"
+
+    agent = LlmAgent(
+        name="assistant",
+        model="gemini-1.5-flash-001",
+        instruction="Help the user.",
+        tools=[
+            google_search,          # Pre-built tool instance
+            get_user_name,          # Python function (auto-wrapped)
+            # my_custom_api_tool,   # Custom BaseTool instance
+        ]
+    )
+    ```
+    *Technical Explanation:* The `LlmAgent` takes a list of tools. Pre-built tools like `google_search` are ready to use. Standard Python functions like `get_user_name` are automatically converted into `FunctionTool` instances by the agent. Custom tools inheriting from `BaseTool` are passed directly. The agent makes these tools available to the LLM during its execution flow.
+
+2.  **Creating a Simple `FunctionTool`:**
+    `FunctionTool` simplifies creating tools from existing Python code. It infers the name, description (from docstring), and parameters (from type hints).
+
+    ```python
+    from google.adk.tools import FunctionTool
+
+    def calculate_discount(price: float, discount_percentage: float) -> float:
+        """Calculates the final price after applying a discount."""
+        if not 0 <= discount_percentage <= 100:
+            raise ValueError("Discount percentage must be between 0 and 100.")
+        final_price = price * (1 - discount_percentage / 100)
+        return round(final_price, 2)
+
+    # Explicitly create a FunctionTool (though passing the function directly
+    # to LlmAgent is more common)
+    discount_tool = FunctionTool(func=calculate_discount)
+
+    # The agent can now reason about when to use 'calculate_discount'
+    # based on its name, description, and parameters.
+    # agent = LlmAgent(..., tools=[discount_tool])
+    ```
+    *Technical Explanation:* `FunctionTool(func=calculate_discount)` wraps the Python function. It inspects the function's signature (`price: float`, `discount_percentage: float`) and docstring to automatically generate the `FunctionDeclaration` needed by the LLM. When the LLM requests to call `calculate_discount`, the framework executes the original Python function via `discount_tool.run_async`.
+
+3.  **Creating a Custom `BaseTool`:**
+    For more complex tools (e.g., requiring specific initialization, complex state management, or not easily represented as a single function), inherit from `BaseTool`.
+
+    ```python
+    from google.adk.tools import BaseTool, ToolContext
+    from google.genai import types
+    from typing import Any, Optional
+
+    class DatabaseLookupTool(BaseTool):
+        def __init__(self, db_connection_string: str):
+            super().__init__(
+                name="lookup_order_status",
+                description="Looks up the status of an order in the database using its ID."
+            )
+            self.db_conn = db_connection_string # Store config
+            # In a real tool, you might establish a connection pool here
+
+        # Define how the tool appears to the LLM
+        @override
+        def _get_declaration(self) -> Optional[types.FunctionDeclaration]:
+            return types.FunctionDeclaration(
+                name=self.name,
+                description=self.description,
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "order_id": types.Schema(type=types.Type.STRING)
+                    },
+                    required=["order_id"],
+                ),
+            )
+
+        # Define the tool's execution logic
+        @override
+        async def run_async(
+            self, *, args: dict[str, Any], tool_context: ToolContext
+        ) -> Any:
+            order_id = args.get("order_id")
+            if not order_id:
+                return {"error": "Missing required parameter: order_id"}
+
+            print(f"Connecting to DB: {self.db_conn}") # Simulate
+            print(f"Looking up status for order: {order_id}")
+            # Simulate DB lookup
+            status = f"Shipped_Status_{order_id}"
+            # Access shared state via tool_context if needed
+            # current_user = tool_context.state.get("user_name")
+
+            # Return result (must be JSON-serializable)
+            return {"order_id": order_id, "status": status}
+
+    # Usage:
+    # db_tool = DatabaseLookupTool(db_connection_string="prod_db_url")
+    # agent = LlmAgent(..., tools=[db_tool])
+    ```
+    *Technical Explanation:* The `DatabaseLookupTool` inherits from `BaseTool`. `__init__` sets the `name`, `description`, and stores configuration. `_get_declaration` manually defines the `FunctionDeclaration` specifying the required `order_id` string parameter. `run_async` implements the core logic: it extracts arguments, performs the simulated database lookup, and returns a dictionary result.
+
+4.  **Accessing `ToolContext`:**
+    The `tool_context` argument passed to `run_async` provides access to the current interaction's context.
+
+    ```python
+    from google.adk.tools import ToolContext, BaseTool
+    from google.adk.sessions import State # For prefixes
+
+    async def my_tool_logic(self, *, args: dict, tool_context: ToolContext) -> dict:
+        # Read from session state
+        user_pref = tool_context.state.get(State.USER_PREFIX + "preferred_units", "metric")
+
+        # Perform calculation using args and user_pref...
+        result_data = f"Calculated using {user_pref} units."
+
+        # Write back to session state (delta will be added to the event)
+        tool_context.state["last_calculation_units"] = user_pref
+
+        # Save an artifact (e.g., a generated report)
+        # report_bytes = b"Report content..."
+        # report_filename = "calculation_report.txt"
+        # tool_context.save_artifact(filename=report_filename, artifact=report_bytes)
+
+        return {"result": result_data} # , "report_artifact": report_filename}
+    ```
+    *Technical Explanation:* `tool_context.state` provides access to the session [State](state.mdc) (using the `State` object's dictionary interface and delta tracking). `tool_context.save_artifact` allows storing binary data associated with the session (requires an `artifact_service` configured in the [Runner](runner.mdc)).
+
+## Internal Implementation
+
+The framework, primarily within the [`BaseLlmFlow`](basellmflow.mdc) implementations (like `AutoFlow`), manages the lifecycle of tool interactions.
+
+**High-Level Flow (Tool Call):**
+
+1.  **Agent Prep:** The [`LlmAgent`](agent__baseagent___llmagent_.mdc) resolves its `tools` list into `canonical_tools`.
+2.  **LLM Request:** The `BaseLlmFlow` gathers `ToolDeclarations` from the tools (via `tool.process_llm_request` which usually calls `_get_declaration`) and includes them in the request to the [BaseLlm](basellm.mdc).
+3.  **LLM Response:** The LLM decides to use a tool and returns a response containing one or more `Part(function_call=...)`.
+4.  **Tool Matching:** The `BaseLlmFlow` extracts the `function_call` parts. For each call, it uses `function_call.name` to find the matching `BaseTool` instance in the agent's `canonical_tools`.
+5.  **Context Creation:** A [`ToolContext`](toolcontext.mdc) is created, linking the call to the current [InvocationContext](invocationcontext.mdc) and providing access to state, etc.
+6.  **Tool Execution:** The flow invokes `tool.run_async(args=function_call.args, tool_context=tool_context)`. Callbacks (`before_tool_callback`, `after_tool_callback`) might wrap this call.
+7.  **Result Packaging:** The flow takes the result returned by `run_async` and packages it into a `Part(function_response=...)`. Any state changes recorded in `tool_context.state._delta` are added to the event's `actions.state_delta`.
+8.  **Event Generation:** An [Event](event.mdc) containing the `function_response` part (and state delta) is created.
+9.  **Return to LLM:** This event is added to the history, and the flow typically sends the history (including the tool result) back to the LLM for the next step (e.g., generating a user-facing response based on the tool output).
+
+**Sequence Diagram (LLM uses a Tool):**
+
+```mermaid
+sequenceDiagram
+    participant Agent as LlmAgent / BaseLlmFlow
+    participant LLM as BaseLlm
+    participant Tool as Matched BaseTool
+    participant Context as ToolContext
+
+    Agent->>+LLM: generate_content_async(request_with_tool_declarations)
+    LLM-->>-Agent: LlmResponse(content=Part(function_call=...))
+    Agent->>Agent: Match function_call.name to Tool instance
+    Agent->>Context: Create ToolContext
+    Agent->>+Tool: run_async(args=function_call.args, tool_context=Context)
+    Tool->>Context: Access/Modify state (ctx.state['key'] = val)
+    Tool-->>-Agent: Return tool_result
+    Agent->>Agent: Create Event(content=Part(function_response=...), actions.state_delta=...)
+    Agent->>+LLM: generate_content_async(request_with_tool_response)
+    LLM-->>-Agent: LlmResponse(content=Part(text=final_answer))
+```
+
+**Code Snippets:**
+
+*   `BaseTool` Interface (`src/google/adk/tools/base_tool.py`):
+    ```python
+    class BaseTool(ABC):
+        name: str
+        description: str
+        is_long_running: bool = False
+        # ... __init__ ...
+
+        def _get_declaration(self) -> Optional[types.FunctionDeclaration]:
+            return None # Must be implemented by subclasses needing declaration
+
+        async def run_async(
+            self, *, args: dict[str, Any], tool_context: ToolContext
+        ) -> Any:
+            # Must be implemented by subclasses needing client-side execution
+            raise NotImplementedError(...)
+
+        async def process_llm_request(
+            self, *, tool_context: ToolContext, llm_request: LlmRequest
+        ) -> None:
+            # Default implementation adds declaration to request config
+            if (function_declaration := self._get_declaration()) is None: return
+            # ... logic to add function_declaration to llm_request.config.tools ...
+            llm_request.tools_dict[self.name] = self # Register tool for lookup
+    ```
+    *Technical Explanation:* Defines the core abstract methods `_get_declaration` and `run_async`, and the `process_llm_request` method which links them by default.
+
+*   `FunctionTool` Implementation (`src/google/adk/tools/function_tool.py`):
+    ```python
+    class FunctionTool(BaseTool):
+        def __init__(self, func: Callable[..., Any]):
+            super().__init__(name=func.__name__, description=func.__doc__)
+            self.func = func
+
+        @override
+        def _get_declaration(self) -> Optional[types.FunctionDeclaration]:
+            # Uses utility to build declaration from function signature/docstring
+            return build_function_declaration(...)
+
+        @override
+        async def run_async(
+            self, *, args: dict[str, Any], tool_context: ToolContext
+        ) -> Any:
+            # ... prepare args, check mandatory params ...
+            if inspect.iscoroutinefunction(self.func):
+                return await self.func(**args_to_call) or {}
+            else:
+                return self.func(**args_to_call) or {}
+    ```
+    *Technical Explanation:* Shows how `FunctionTool` overrides `_get_declaration` to automatically generate it and `run_async` to execute the wrapped Python function.
+
+*   Tool Execution Logic (`src/google/adk/flows/llm_flows/functions.py`):
+    ```python
+    # Simplified from handle_function_calls_async
+    async def handle_function_calls_async(
+        invocation_context: InvocationContext,
+        function_call_event: Event,
+        tools_dict: dict[str, BaseTool], # Resolved tools from agent
+        # ...
+    ) -> Optional[Event]:
+        # ... loop through function_calls in function_call_event ...
+        function_call = ... # Get one FunctionCall part
+
+        # Find the tool instance
+        tool, tool_context = _get_tool_and_context(
+            invocation_context, function_call_event, function_call, tools_dict
+        )
+
+        function_args = function_call.args or {}
+        function_response = None
+
+        # Optional: Execute before_tool_callback
+        # ...
+
+        # Execute the tool's core logic
+        if not function_response:
+            function_response = await __call_tool_async( # Calls tool.run_async
+                tool, args=function_args, tool_context=tool_context
+            )
+
+        # Optional: Execute after_tool_callback
+        # ...
+
+        # Build the FunctionResponse event
+        function_response_event = __build_response_event(
+            tool, function_response, tool_context, invocation_context
+        )
+        # ... collect and merge events ...
+        return merged_event
+    ```
+    *Technical Explanation:* This function within the flow logic demonstrates the core steps: finding the tool based on the `function_call.name`, creating the `ToolContext`, calling `tool.run_async` (via `__call_tool_async`), and building the response event.
+
+## Conclusion
+
+The `Tool` (`BaseTool`) abstraction is fundamental to building capable agents in `google-adk`. It provides a structured way to define, declare, and execute external capabilities, allowing agents to interact with APIs, search for information, run code, and access other systems. By equipping [`LlmAgents`](agent__baseagent___llmagent_.mdc) with appropriate tools, developers can create sophisticated applications that ground LLM reasoning in real-world data and actions.
+
+Understanding how tools are defined and executed sets the stage for the next chapter, which delves into the orchestrator responsible for managing the interaction between the LLM and these tools: the [BaseLlmFlow](basellmflow.mdc).
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

@@ -1,0 +1,237 @@
+---
+description: Details google-adk's State object for managing session state with scopes and delta tracking.
+globs: src/google/adk/sessions/state.py
+alwaysApply: false
+---
+# Chapter 4: State
+
+In the [previous chapter](session__session___basesessionservice_.mdc), we saw how the `Session` object holds conversational history (`events`) and a `state` dictionary to maintain context across turns. This chapter dives deep into that `state` dictionary's wrapper: the `State` object. It's designed to provide a consistent view of the session's state while meticulously tracking changes made *during* a specific agent turn or callback execution.
+
+## Motivation and Use Case
+
+When an agent processes a request, it often needs to:
+1.  **Read existing information:** What did the user previously specify as their destination?
+2.  **Store new information:** The agent just identified the user's budget.
+3.  **Track intermediate changes:** A tool call successfully fetched flight options, which need to be stored temporarily *before* being presented to the user or used in the next LLM call.
+4.  **Manage different scopes:** Some information might be relevant only to the current chat (session state), while other details (like user preferences) should persist across different chats (user state).
+
+Managing this directly within a simple dictionary passed around can be error-prone. How do we ensure that changes made during a complex turn (involving callbacks, LLM calls, tool executions) are correctly captured and associated with the final outcome ([Event](event.mdc)) for persistence?
+
+The `State` object addresses this by acting as a smart dictionary wrapper. It provides access to the underlying session state but records any modifications made during the current context (e.g., a callback or tool execution) into a separate "delta". This delta is then attached to the resulting `Event`, ensuring the [Session (Session / BaseSessionService)](session__session___basesessionservice_.mdc) can accurately update the persistent state.
+
+**Central Use Case:** Consider our travel agent bot.
+*   The `Session` starts with `state = {'origin': 'London'}`.
+*   The agent's `run_async` is called. An `InvocationContext` is created.
+*   Inside a `before_model_callback`, we access `ctx.state`. `ctx.state['origin']` returns 'London'.
+*   The callback sets a temporary flag: `ctx.state[State.TEMP_PREFIX + 'needs_clarification'] = True`. This is added to the delta but won't be persisted.
+*   The LLM runs and invokes a `find_flights` tool.
+*   Inside the tool's execution, it accesses `ctx.state` via `ToolContext`. It finds flights and updates the state: `ctx.state['available_flights'] = [...]`. This change is recorded in the delta. `ctx.state['origin']` still returns 'London'.
+*   The tool yields an [Event](event.mdc). This event's `actions.state_delta` now contains `{'available_flights': [...]}`. The `temp:` key is *not* included for persistence.
+*   The [Runner](runner.mdc) calls `session_service.append_event` with this event. The service updates the persistent session state by merging the `state_delta`.
+*   In the *next* turn, when the `Session` is loaded, its base `state` will include `{'origin': 'London', 'available_flights': [...]}`.
+
+## Key Concepts
+
+*   **Dictionary-like Interface:** The `State` object behaves like a standard Python dictionary for accessing and modifying data. You use `state[key]` to get a value and `state[key] = value` to set one. Methods like `get()`, `update()`, and `__contains__` are also available.
+*   **Delta Tracking:** The core feature. `State` is initialized with two dictionaries:
+    *   `_value`: A reference to the actual state dictionary loaded from the `Session`.
+    *   `_delta`: A dictionary (usually `event_actions.state_delta`) to record changes made *through this `State` instance*.
+*   **Unified View:** When you read a key (`state[key]`), `State` first checks if the key exists in its `_delta`. If yes, it returns the delta value (the most recent change). If not, it returns the value from the base `_value` dictionary.
+*   **Mutation Behavior:** When you set a key (`state[key] = value`), the `State` object performs two actions:
+    1.  It updates the value directly in the underlying `_value` dictionary (the reference passed during initialization, typically `session.state`).
+    2.  It adds or updates the key-value pair in the `_delta` dictionary (typically `event_actions.state_delta`). This ensures the change is recorded for persistence via the associated [Event](event.mdc).
+*   **State Scopes (Prefixes):** `State` defines constants for key prefixes to signal different persistence scopes to the underlying [Session (Session / BaseSessionService)](session__session___basesessionservice_.mdc):
+    *   **`State.APP_PREFIX` ("app:")**: Application-level state. Shared across all users and sessions for a given application. Requires a `SessionService` that supports it (e.g., `DatabaseSessionService`).
+    *   **`State.USER_PREFIX` ("user:")**: User-level state. Shared across all sessions for a specific user within an application. Requires a supporting `SessionService`.
+    *   **(No Prefix)**: Session-level state (Default). Specific to the current `Session`. Supported by all services.
+    *   **`State.TEMP_PREFIX` ("temp:")**: Temporary state. Exists only within the current turn/context (e.g., during a single `run_async` call). Changes are recorded in the delta but are explicitly *ignored* by the `BaseSessionService` during persistence. Useful for passing transient data between callbacks or tools within a single invocation.
+*   **`has_delta()`:** A method (`state.has_delta()`) that returns `True` if any modifications have been made (i.e., if the `_delta` dictionary is not empty), `False` otherwise.
+
+## How to Use `State`
+
+You typically don't instantiate `State` directly. Instead, you access it through context objects provided by the framework, primarily:
+*   [CallbackContext](invocationcontext.mdc): Passed to agent/model/tool callbacks (`before_agent_callback`, `after_model_callback`, etc.).
+*   [ToolContext](toolcontext.mdc): Passed to the execution logic of a [Tool (BaseTool)](tool__basetool_.mdc).
+
+Both `CallbackContext` and `ToolContext` expose the `State` object via their `state` attribute (e.g., `ctx.state`).
+
+1.  **Accessing State:**
+
+    ```python
+    from google.adk.agents import InvocationContext # Used by context objects
+    from google.adk.sessions.state import State # For prefixes
+
+    def my_callback(ctx: CallbackContext, ...):
+        # Get session state (checks delta first, then base)
+        current_topic = ctx.state.get("topic", "general_chat")
+        print(f"Current topic: {current_topic}")
+
+        # Get user preference (if set previously)
+        user_pref = ctx.state.get(State.USER_PREFIX + "theme")
+        if user_pref:
+            print(f"User theme preference: {user_pref}")
+
+        # Check if a key exists
+        if "last_tool_result" in ctx.state:
+            print("Last tool result found in state.")
+    ```
+    *Technical Explanation:* Use standard dictionary access methods (`get`, `[]`, `in`) on `ctx.state`. The `State` object handles looking up the value in the delta or the base state. Use prefixes like `State.USER_PREFIX` for non-session scopes.
+
+2.  **Modifying State:**
+
+    ```python
+    from google.adk.agents import InvocationContext
+    from google.adk.sessions.state import State
+
+    def my_tool_logic(ctx: ToolContext, **tool_args):
+        # Tool processes args and gets a result
+        flight_data = {"number": "BA123", "status": "on_time"}
+
+        # Update session state
+        ctx.state["last_flight_info"] = flight_data
+
+        # Update user state (persists across sessions for this user)
+        ctx.state[State.USER_PREFIX + "preferred_airline"] = "British Airways"
+
+        # Set a temporary flag for this turn only
+        ctx.state[State.TEMP_PREFIX + "tool_ran_successfully"] = True
+
+        print("State updated with flight info and preferences.")
+        # Now, if this tool yields an Event, its actions.state_delta
+        # will contain {'last_flight_info': ..., 'user:preferred_airline': ...}
+        # The 'temp:...' key will NOT be persisted by the SessionService.
+    ```
+    *Technical Explanation:* Assigning a value using `ctx.state[key] = value` modifies the state. This automatically updates both the underlying session state dictionary *and* the `state_delta` associated with the current context's `EventActions`. Use `State.TEMP_PREFIX` for data that should not be persisted beyond the current turn.
+
+3.  **Checking for Changes:**
+
+    ```python
+    def my_other_callback(ctx: CallbackContext, ...):
+        # ... some logic that might modify state ...
+
+        if ctx.state.has_delta():
+            print("State was modified during this callback.")
+            # Maybe yield a specific event indicating changes were made
+        else:
+            print("No state changes detected in this callback.")
+    ```
+    *Technical Explanation:* The `has_delta()` method returns `True` if any `ctx.state[...] = ...` assignments occurred within the current scope where `ctx` is valid.
+
+## Internal Implementation
+
+*   **`State` Class (`src/google/adk/sessions/state.py`):**
+    The `State` object itself is relatively simple. It holds references to the base state and the delta dictionary.
+
+    ```python
+    # Simplified from src/google/adk/sessions/state.py
+    from typing import Any
+
+    class State:
+        APP_PREFIX = "app:"
+        USER_PREFIX = "user:"
+        TEMP_PREFIX = "temp:"
+
+        def __init__(self, value: dict[str, Any], delta: dict[str, Any]):
+            self._value = value # Reference to session.state (or similar)
+            self._delta = delta # Reference to actions.state_delta
+
+        def __getitem__(self, key: str) -> Any:
+            # Check delta first for the most recent value
+            if key in self._delta:
+                return self._delta[key]
+            # Fallback to the base value
+            return self._value[key]
+
+        def __setitem__(self, key: str, value: Any):
+            # Update the base dictionary directly
+            self._value[key] = value
+            # Record the change in the delta dictionary
+            self._delta[key] = value
+
+        def __contains__(self, key: str) -> bool:
+            return key in self._delta or key in self._value
+
+        def has_delta(self) -> bool:
+            return bool(self._delta)
+
+        def get(self, key: str, default: Any = None) -> Any:
+            # ... implementation checks contains first ...
+            if key not in self:
+              return default
+            return self[key]
+
+        # ... other methods like update(), to_dict() ...
+    ```
+    *Technical Explanation:* `__init__` stores references. `__getitem__` prioritizes `_delta`. `__setitem__` updates *both* `_value` (the original dict) and `_delta` (the changes dict) ensuring consistency and tracking.
+
+*   **Context Initialization (`src/google/adk/agents/callback_context.py`):**
+    Context objects like `CallbackContext` are responsible for creating the `State` instance correctly.
+
+    ```python
+    # Simplified from src/google/adk/agents/callback_context.py
+    class CallbackContext(ReadonlyContext):
+        def __init__(
+            self,
+            invocation_context: InvocationContext,
+            *,
+            event_actions: Optional[EventActions] = None,
+        ) -> None:
+            super().__init__(invocation_context)
+            from ..events.event_actions import EventActions
+            from ..sessions.state import State
+
+            # Ensure we have an EventActions object
+            self._event_actions = event_actions or EventActions()
+
+            # Create the State instance:
+            # - value = the actual state dict from the session
+            # - delta = the state_delta dict within EventActions
+            self._state = State(
+                value=invocation_context.session.state,
+                delta=self._event_actions.state_delta,
+            )
+
+        @property
+        @override
+        def state(self) -> State:
+            # Exposes the initialized _state object
+            return self._state
+    ```
+    *Technical Explanation:* `CallbackContext` initializes `State` by passing the session's live state dictionary (`invocation_context.session.state`) as the `value` and the `state_delta` dictionary from its associated `EventActions` object as the `delta`. This links modifications made via `ctx.state` directly to the `state_delta` that will be included in any subsequent [Event](event.mdc).
+
+*   **Persistence Flow (`BaseSessionService` & Runner):**
+    The delta tracked by `State` eventually gets persisted when an event is saved.
+
+    ```mermaid
+    sequenceDiagram
+        participant Actor as Agent/Tool/Callback
+        participant Context as CallbackContext / ToolContext
+        participant StateObj as State
+        participant Actions as EventActions
+        participant Runner
+        participant SessionSvc as BaseSessionService
+
+        Actor->>Context: Access ctx.state
+        Context->>StateObj: (Returns State instance)
+        Actor->>StateObj: ctx.state['new_key'] = 'new_value'
+        StateObj->>StateObj: Updates self._value (session.state ref)
+        StateObj->>Actions: Updates self._delta (actions.state_delta ref)
+        Actor->>Runner: yield Event (containing Actions)
+        Runner->>SessionSvc: append_event(session, event)
+        SessionSvc->>SessionSvc: Process event.actions.state_delta
+        Note right of SessionSvc: Ignores 'temp:' keys,<br/>Updates persistent storage<br/>(DB, memory, etc.)<br/>for relevant scopes.
+        SessionSvc-->>Runner: (Event appended)
+        Runner-->>Actor: (Continues processing)
+    ```
+    *Technical Explanation:* This diagram illustrates how setting a value via `ctx.state` propagates the change to both the in-memory session state and the `state_delta` within `EventActions`. When the `Runner` appends the event containing these actions, the `SessionService` uses the `state_delta` to update the persistent state, ignoring any temporary (`temp:`) variables.
+
+## Conclusion
+
+The `State` object is a crucial abstraction in `google-adk` for managing dynamic information within a conversation. By providing a familiar dictionary interface while transparently tracking modifications (`deltas`) and respecting different scopes (`app:`, `user:`, session, `temp:`), it ensures that state changes are reliably captured and associated with specific events. This mechanism allows agents and tools to collaboratively build up context throughout an interaction, with the `SessionService` handling the persistence details based on the recorded deltas.
+
+Now that we understand how session state is managed and updated, the next chapter will focus on the vehicle that carries these updates and represents all interactions within a session: the [Event](event.mdc).
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

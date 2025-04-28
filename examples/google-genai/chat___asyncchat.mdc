@@ -1,0 +1,274 @@
+---
+description: Explains google-genai Chat/AsyncChat classes, stateful wrappers for managing multi-turn conversation history with generative models.
+globs: 
+alwaysApply: false
+---
+# Chapter 4: Chat / AsyncChat
+
+In [Chapter 3: API Modules (Models, Chats, Files, Tunings, Caches, Batches, Operations, Live)](api_modules__models__chats__files__tunings__caches__batches__operations__live_.mdc), we saw how the SDK organizes functionalities into modules like `Models`. While `client.models.generate_content` is powerful, using it directly for conversations requires manually managing the history: appending the user's message, sending the full history, and then appending the model's response. This chapter introduces `Chat` and `AsyncChat`, abstractions designed to simplify this common pattern.
+
+## Motivation and Use Case
+
+Building conversational AI requires maintaining the context of the interaction over multiple turns. Sending only the latest user message to the model results in stateless, disconnected responses. The model needs the preceding dialogue to understand the context and respond coherently. Manually constructing the `list[Content]` history for every API call can be repetitive and error-prone, especially when handling potential errors or invalid responses from the model.
+
+The `Chat` (and its asynchronous counterpart `AsyncChat`) provides a stateful object that automatically manages this conversation `history`. You send a message, and the `Chat` object handles appending it to the history, calling the underlying `Models` module with the full context, and storing the model's response, ready for the next turn.
+
+**Central Use Case:** Imagine creating a simple chatbot that remembers previous interactions.
+
+```python
+# Assuming 'client' is configured (e.g., using genai.Client(api_key=...))
+from google import genai
+from google.genai import types
+
+# 1. Create a Chat session using the 'chats' module factory
+# Note: client.chats is a factory for Chat instances
+chat = client.chats.create(model='gemini-1.5-flash') # Or your preferred model
+
+# 2. Send the first message
+response1 = chat.send_message("Hello! My name is Alex.")
+print(f"AI: {response1.text}")
+
+# 3. Send the second message - the Chat object remembers the first turn
+response2 = chat.send_message("What is my name?")
+print(f"AI: {response2.text}") # The AI should know your name is Alex
+
+# 4. Inspect the history managed by the Chat object
+print("\n--- Chat History ---")
+# Use get_history(curated=True) for only valid turns sent to the model
+for content in chat.get_history(curated=False): # Shows all turns
+    print(f"{content.role.capitalize()}: {content.parts[0].text}")
+
+```
+This example shows how `chat.send_message` handles the history. The second call automatically includes the context ("Hello! My name is Alex." and the AI's first response) when generating the answer to "What is my name?".
+
+## Key Concepts
+
+### Stateful Conversation Management
+
+*   **Instance-based:** Each `Chat` object represents a *single*, independent conversation session.
+*   **Internal History:** The core feature is the internal `history`, stored as a list of `types.Content` objects ([Chapter 2: Content / Part](content___part.mdc)).
+*   **Automatic Updates:** Methods like `send_message` and `send_message_stream` automatically:
+    1.  Take the new user message.
+    2.  Append it to the current (curated) history.
+    3.  Send the combined history to the model via the `Models` module.
+    4.  Append the model's response back to the internal history list(s).
+
+### Comprehensive vs. Curated History
+
+The `Chat` object maintains two views of the history:
+
+1.  **Comprehensive History (`_comprehensive_history`):** Stores *all* attempts, including user messages and the corresponding model responses, even if a model response was invalid (e.g., blocked by safety filters, produced empty content, or encountered an error during automatic function calling). Accessed via `chat.get_history(curated=False)`.
+2.  **Curated History (`_curated_history`):** Stores only the sequence of *valid* turns (user input followed by a valid model response). This is the history actually sent to the model on subsequent `send_message` calls to ensure the model builds upon a coherent and valid dialogue. Accessed via `chat.get_history(curated=True)`.
+
+The SDK determines validity using internal checks like `_validate_content` and `_validate_response` (in `google/genai/chats.py`), ensuring parts are not empty and the response structure is sound.
+
+### Core Methods
+
+*   **`send_message(message, config=None)`:** Sends the user's `message` along with the curated history to the model. Appends the user message and the model's response to the internal histories. Returns a `GenerateContentResponse`. The `message` argument accepts the same flexible inputs as `Models.generate_content`'s `contents` parameter (string, `Part`, list of `Part`s), utilizing [Transformers (`t_` functions)](transformers___t___functions_.mdc).
+*   **`send_message_stream(message, config=None)`:** Similar to `send_message`, but returns an `Iterator` (or `AsyncIterator` for `AsyncChat`) yielding `GenerateContentResponse` chunks as they arrive from the model. History is updated after the stream completes.
+*   **`get_history(curated=False)`:** Returns the conversation history as a `list[types.Content]`. Use `curated=True` to get only the valid turns used for model context.
+
+## Usage
+
+### Creating a Chat Session
+
+You don't instantiate `Chat` or `AsyncChat` directly. Instead, you use the factory methods provided by the `Chats` or `AsyncChats` modules accessed via the client:
+
+```python
+# Synchronous Chat
+chat_sync = client.chats.create(
+    model='gemini-1.5-flash',
+    # Optional: initial history
+    history=[
+        types.Content(role='user', parts=[types.Part.from_text("You are a helpful assistant.")] ),
+        types.Content(role='model', parts=[types.Part.from_text("Okay, how can I help?")])
+    ],
+    # Optional: default config for all send_message calls
+    config=types.GenerateContentConfig(temperature=0.7)
+)
+
+# Asynchronous Chat
+# chat_async = await client.aio.chats.create(model='gemini-1.5-flash') # Requires async context
+```
+The `client.chats` (or `client.aio.chats`) acts as a factory, returning a new `Chat` (or `AsyncChat`) instance configured with the specified model, optional initial history, and optional default generation configuration.
+
+### Sending Messages and Streaming
+
+```python
+# Using the chat_sync created above
+response = chat_sync.send_message("What's the weather like today?")
+print(f"AI: {response.text}")
+
+# Streaming response
+print("\nStreaming AI response:")
+full_streamed_response = ""
+for chunk in chat_sync.send_message_stream("Tell me a short poem."):
+    if chunk.text: # Check if the chunk contains text
+        print(chunk.text, end='', flush=True)
+        full_streamed_response += chunk.text
+print() # Newline after stream
+
+# The history now includes the weather Q&A and the poem Q&A
+# print(chat_sync.get_history(curated=True))
+```
+
+### Asynchronous Usage (`AsyncChat`)
+
+The pattern is identical for `AsyncChat`, but uses `async`/`await`:
+
+```python
+import asyncio
+
+async def run_async_chat():
+    # Assuming 'client' is configured
+    chat_async = client.aio.chats.create(model='gemini-1.5-flash')
+
+    response1 = await chat_async.send_message("Ping")
+    print(f"Async AI: {response1.text}")
+
+    print("\nStreaming Async AI response:")
+    async for chunk in await chat_async.send_message_stream("Pong?"):
+         if chunk.text:
+              print(chunk.text, end='', flush=True)
+    print()
+
+# asyncio.run(run_async_chat()) # Uncomment to run
+```
+
+## Internal Implementation
+
+### High-Level Flow (`send_message`)
+
+1.  **Input Transformation:** The user's `message` is converted into a `types.Content` object with `role='user'` using the internal [`t_content` transformer](transformers___t___functions_.mdc).
+2.  **Prepare Contents:** The newly created user `Content` is appended to the *curated* history (`self._curated_history`).
+3.  **Delegate to Models:** The combined list of `Content` objects (curated history + new user message) is passed to the `self._modules.generate_content` method (where `_modules` is the `Models` or `AsyncModels` instance passed during creation).
+4.  **Receive Response:** The `generate_content` call returns a `GenerateContentResponse`.
+5.  **Validate Response:** Internal checks (`_validate_response`) determine if the model's output in the response is valid.
+6.  **Record History:** The `record_history` method (from the `_BaseChat` superclass) is called. It appends the new user `Content` and the model's response `Content`(s) (or an empty placeholder if invalid/none) to the `_comprehensive_history`. If the response was deemed *valid*, they are also appended to the `_curated_history`. Special handling exists for `automatic_function_calling_history` if function calling occurred.
+7.  **Return Response:** The `GenerateContentResponse` is returned to the user.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Chat as chat.send_message(msg)
+    participant T as t_content(msg)
+    participant Models as client.models.generate_content(...)
+    participant BaseChat as _BaseChat.record_history(...)
+    participant API as Backend API
+
+    User->>Chat: Call send_message(message)
+    Chat->>T: Convert message to Content
+    T-->>Chat: Return user_content
+    Chat->>Models: Call generate_content(curated_history + user_content, config)
+    Models->>API: Send API Request(history + user_content)
+    API-->>Models: Receive API Response
+    Models-->>Chat: Return GenerateContentResponse
+    Chat->>BaseChat: Call record_history(user_content, model_response, afc_history, is_valid)
+    BaseChat-->>Chat: Update internal history (_comprehensive, _curated)
+    Chat-->>User: Return GenerateContentResponse
+```
+
+### Code Snippets (`google/genai/chats.py`)
+
+*   **Base Class and History Recording:** The common logic resides in `_BaseChat`.
+  ```python
+  # Simplified from google/genai/chats.py
+  class _BaseChat:
+      def __init__(self, ..., history: list[ContentOrDict]):
+          # ... store model, config ...
+          content_models = # ... convert history list to Content objects ...
+          self._comprehensive_history = content_models
+          self._curated_history = _extract_curated_history(content_models)
+
+      def record_history(self, user_input: Content, model_output: list[Content], ..., is_valid: bool):
+          # ... handle automatic function calling history ...
+          input_contents = # Deduplicated user input(s)
+          output_contents = model_output if model_output else [Content(role="model", parts=[])] # Handle empty response
+
+          self._comprehensive_history.extend(input_contents)
+          self._comprehensive_history.extend(output_contents)
+          if is_valid:
+              self._curated_history.extend(input_contents)
+              self._curated_history.extend(output_contents)
+
+      def get_history(self, curated: bool = False) -> list[Content]:
+          return self._curated_history if curated else self._comprehensive_history
+  ```
+  This shows the initialization storing both history types and the `record_history` logic conditionally updating `_curated_history`.
+
+*   **`Chat.send_message` Implementation:**
+  ```python
+  # Simplified from google/genai/chats.py
+  class Chat(_BaseChat):
+      def __init__(self, *, modules: Models, ...):
+          self._modules = modules # Instance of Models API module
+          super().__init__(...)
+
+      def send_message(self, message: ..., config: ... ) -> GenerateContentResponse:
+          # ... input validation (_is_part_type) ...
+          input_content = t.t_content(self._modules._api_client, message) # Transform input
+
+          # Call the Models module with curated history + new message
+          response = self._modules.generate_content(
+              model=self._model,
+              contents=self._curated_history + [input_content], # Send curated context
+              config=config if config else self._config,
+          )
+
+          model_output = # Extract content from response.candidates
+          afc_history = # Extract AFC history if present
+          is_valid = _validate_response(response) # Check validity
+
+          # Update internal histories
+          self.record_history(
+              user_input=input_content,
+              model_output=model_output,
+              automatic_function_calling_history=afc_history,
+              is_valid=is_valid,
+          )
+          return response
+  ```
+  This highlights the delegation to `self._modules.generate_content` and the call to `self.record_history` after receiving the response.
+
+*   **Curated History Extraction:**
+  ```python
+  # Simplified logic from google/genai/chats.py _extract_curated_history
+  def _extract_curated_history(comprehensive_history: list[Content]) -> list[Content]:
+      curated_history = []
+      i = 0
+      while i < len(comprehensive_history):
+          # Expect 'user' turn
+          current_input = comprehensive_history[i]
+          if current_input.role != "user": raise ValueError(...)
+          i += 1
+
+          # Collect subsequent 'model' turns
+          current_output_block = []
+          is_valid_block = True
+          while i < len(comprehensive_history) and comprehensive_history[i].role == "model":
+              model_content = comprehensive_history[i]
+              current_output_block.append(model_content)
+              if is_valid_block and not _validate_content(model_content):
+                   is_valid_block = False # Mark block as invalid if any part is invalid
+              i += 1
+
+          # If the whole model block was valid, add input and output to curated history
+          if is_valid_block and current_output_block: # Must have some model output
+               curated_history.append(current_input)
+               curated_history.extend(current_output_block)
+          # If invalid or no model output, skip this turn (input + output block)
+      return curated_history
+
+  ```
+  This function iterates through the comprehensive history, pairing user inputs with subsequent model responses. It only adds a turn (user input + model response block) to the `curated_history` if the *entire* model response block consists of valid `Content` objects.
+
+## Conclusion
+
+`Chat` and `AsyncChat` provide essential stateful abstractions for building conversational applications with the `google-genai` SDK. By automatically managing the `history` (both comprehensive and curated) and wrapping the calls to the underlying `Models` module, they significantly simplify the process of maintaining context in multi-turn dialogues. Understanding the distinction between comprehensive and curated history is key to debugging and ensuring the model receives appropriate context.
+
+While `Chat` handles basic conversation flow, many applications require the model to interact with external tools or APIs. The next chapter, [Function Calling Utilities](function_calling_utilities.mdc), explores how the SDK facilitates this powerful feature.
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

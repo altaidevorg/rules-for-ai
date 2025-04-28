@@ -1,0 +1,309 @@
+---
+description: Flax NNX Filters (filterlib) for selecting Variables in Modules/State using types, tags, paths, predicates, and logical combinations.
+globs: 
+alwaysApply: false
+---
+# Chapter 4: Filters (`filterlib`)
+
+In the previous chapters, we learned how [nnx.Module](nnx_module.mdc) defines network components, how [nnx.Variable / nnx.VariableState](nnx_variable___nnx_variablestate.mdc) represents their state, and how [nnx.Rngs](nnx_rngs.mdc) manages randomness. Models often contain diverse state elements (parameters, batch statistics, caches, RNG state, etc.) nested within complex structures. When working with these models, especially when using the [NNX Functional API (split/merge/state/update/graphdef)](nnx_functional_api__split_merge_state_update_graphdef_.mdc) or applying [NNX Lifted Transforms (jit, grad, vmap, scan, etc.)](nnx_lifted_transforms__jit__grad__vmap__scan__etc__.mdc), we frequently need to select *specific subsets* of this state. This is where Filters come in.
+
+## Motivation: Targeted State Manipulation
+
+Imagine you want to:
+*   Apply an optimizer update only to the learnable parameters (`nnx.Param`) and not the batch statistics (`nnx.BatchStat`).
+*   Extract only the batch statistics to update them manually during inference.
+*   Specify which parts of the state should be differentiated using `nnx.grad`.
+*   Define how different state components should be handled (mapped, broadcasted, carried) in `nnx.vmap` or `nnx.scan`.
+*   Remove temporary state like intermediate activations (`nnx.Intermediate`) after a forward pass.
+
+Manually traversing the nested `State` pytree and checking types or names for each `VariableState` would be verbose and error-prone. Filters provide a concise and powerful declarative language for specifying these selections.
+
+## Central Use Case: Separating Parameters and Batch Statistics
+
+A common task is separating the parameters that need gradients from the batch statistics that are updated differently. Filters make this straightforward using `nnx.split`.
+
+```python
+import jax
+import jax.numpy as jnp
+from flax import nnx
+
+class MyModel(nnx.Module):
+  def __init__(self, *, rngs: nnx.Rngs):
+    self.layer1 = nnx.Linear(10, 20, rngs=rngs)
+    self.bn = nnx.BatchNorm(20, use_running_average=False, rngs=rngs)
+    self.layer2 = nnx.Linear(20, 5, rngs=rngs)
+
+  def __call__(self, x):
+    x = self.layer1(x)
+    x = self.bn(x)
+    x = nnx.relu(x)
+    x = self.layer2(x)
+    return x
+
+model = MyModel(rngs=nnx.Rngs(0))
+
+# Use Variable types as filters in nnx.split
+graphdef, params_state, bn_state, other_state = nnx.split(
+    model, 
+    nnx.Param,       # Filter 1: Select all nnx.Param variables
+    nnx.BatchStat,   # Filter 2: Select all nnx.BatchStat variables
+    ...              # Filter 3: Select everything else (Ellipsis or True)
+)
+
+print("--- Parameters (nnx.Param) ---")
+# params_state contains only VariableState objects whose type is nnx.Param
+print(params_state) 
+
+print("\n--- Batch Statistics (nnx.BatchStat) ---")
+# bn_state contains only VariableState objects whose type is nnx.BatchStat
+print(bn_state)
+
+print("\n--- Other State (e.g., RngState for BatchNorm) ---")
+# other_state contains the rest (e.g., RngState from BatchNorm)
+print(other_state)
+
+# Reconstruct the model
+model_merged = nnx.merge(graphdef, params_state, bn_state, other_state)
+```
+
+**Example Output (Structure shown, values omitted):**
+```
+--- Parameters (nnx.Param) ---
+State({
+  'bn': {'bias': VariableState(type=Param, ...), 'scale': VariableState(type=Param, ...)}, 
+  'layer1': {'bias': VariableState(type=Param, ...), 'kernel': VariableState(type=Param, ...)}, 
+  'layer2': {'bias': VariableState(type=Param, ...), 'kernel': VariableState(type=Param, ...)}
+})
+
+--- Batch Statistics (nnx.BatchStat) ---
+State({
+  'bn': {'mean': VariableState(type=BatchStat, ...), 'var': VariableState(type=BatchStat, ...)}
+})
+
+--- Other State (e.g., RngState for BatchNorm) ---
+State({
+  'bn': {'rngs': {'dropout': VariableState(type=RngStream, ...)}}
+})
+```
+This example shows how `nnx.Param` and `nnx.BatchStat` (which are types inheriting from `nnx.Variable`) directly act as filters passed to `nnx.split`. The `...` (Ellipsis) acts as a catch-all for any remaining variables.
+
+## Key Concepts
+
+Filters, defined in `flax.nnx.filterlib`, are specifications that resolve to boolean predicates. These predicates take `(path: PathParts, value: Any)` as input, where `path` is the tuple path to a node in the state pytree and `value` is the node itself (often a `VariableState` at the leaves), and return `True` if the node matches the filter criteria.
+
+### 1. Filter Types (Literals)
+
+You can specify filters using several convenient literals:
+
+*   **Variable Type:** Pass a subclass of `nnx.Variable` (e.g., `nnx.Param`, `nnx.BatchStat`, `nnx.RngState`). This selects all `Variable` or `VariableState` instances whose type *is or inherits from* the specified type.
+    ```python
+    # Selects all parameters
+    param_filter = nnx.Param 
+    # Selects all variables (useful as a catch-all sometimes)
+    variable_filter = nnx.Variable 
+    ```
+*   **String Tag:** Pass a string. This selects `Variable` or `VariableState` instances that have a `tag` attribute matching the string. `nnx.Rngs` uses tags to identify its streams (e.g., `'params'`, `'dropout'`). Internally, this uses `nnx.WithTag`.
+    ```python
+    # Selects RNG state associated with the 'dropout' stream
+    dropout_rng_filter = 'dropout' 
+    ```
+    *Note:* Tags are less commonly defined manually on variables compared to using variable types. `nnx.Rngs` is a primary user.
+*   **Predicate Function:** Provide a function `Callable[[PathParts, Any], bool]`. This gives maximum flexibility for custom selection logic based on the variable's path or value properties.
+    ```python
+    # Selects variables whose name (last part of path) is 'kernel'
+    def is_kernel(path: nnx.PathParts, value: tp.Any) -> bool:
+        return path and path[-1] == 'kernel'
+
+    kernel_filter = is_kernel 
+    ```
+*   **Boolean / Ellipsis:**
+    *   `True` or `...` (Ellipsis): Selects everything. Often used as the last filter in `nnx.split` to capture the remaining state.
+    *   `False` or `None`: Selects nothing.
+*   **Path-based Filters:** `filterlib` provides classes for common path checks:
+    *   `nnx.PathContains(key)`: Selects nodes where `key` appears anywhere in their `PathParts`.
+    *   `nnx.PathIn(*paths)`: Selects nodes whose exact path matches one of the provided `paths`.
+    ```python
+    # Selects anything under the 'bn' submodule
+    bn_filter = nnx.PathContains('bn') 
+
+    # Selects only the specific variable model.layer1.bias
+    specific_bias_filter = nnx.PathIn(('layer1', 'bias'))
+    ```
+
+### 2. Logical Combinations
+
+Combine basic filters using logical operators:
+
+*   `nnx.Any(*filters)`: Logical OR. Selects nodes matching *at least one* of the provided filters. Also implicitly used when a list/tuple of filters is provided.
+    ```python
+    # Selects Parameters OR BatchStats
+    params_or_bn = nnx.Any(nnx.Param, nnx.BatchStat)
+    # Equivalent shorthand (list/tuple implies Any)
+    params_or_bn_short = [nnx.Param, nnx.BatchStat] 
+    ```
+*   `nnx.All(*filters)`: Logical AND. Selects nodes matching *all* of the provided filters.
+    ```python
+    # Selects variables that are Params AND have 'kernel' in their path
+    kernel_params = nnx.All(nnx.Param, nnx.PathContains('kernel'))
+    ```
+*   `nnx.Not(filter)`: Logical NOT. Selects nodes that *do not* match the provided filter.
+    ```python
+    # Selects everything EXCEPT nnx.Param
+    not_params = nnx.Not(nnx.Param) 
+    ```
+
+### 3. Conversion to Predicates (`to_predicate`)
+
+Internally, functions like `nnx.split` use `filterlib.to_predicate(filter_literal)` to convert the user-provided filter literal (type, string, boolean, object like `PathContains`, etc.) into a standard predicate function `Callable[[PathParts, Any], bool]`. This allows the underlying state traversal logic to work consistently.
+
+*   `nnx.Param` becomes `OfType(nnx.Param)`
+*   `'dropout'` becomes `WithTag('dropout')`
+*   `True` becomes `Everything()`
+*   `False` becomes `Nothing()`
+*   `[nnx.Param, nnx.BatchStat]` becomes `Any(OfType(nnx.Param), OfType(nnx.BatchStat))`
+
+You typically don't call `to_predicate` directly but understanding this conversion helps in reasoning about how filters work.
+
+## Applying Filters
+
+Filters are primarily used with the [NNX Functional API (split/merge/state/update/graphdef)](nnx_functional_api__split_merge_state_update_graphdef_.mdc) and [NNX Lifted Transforms (jit, grad, vmap, scan, etc.)](nnx_lifted_transforms__jit__grad__vmap__scan__etc__.mdc).
+
+*   **`nnx.split(module_or_state, *filters)`:** Splits the state into multiple partitions based on the filters. Each `VariableState` goes into the first partition whose filter it matches. If `...` or `True` is used as the last filter, it catches any remaining variables.
+*   **`nnx.state(module_or_state, *filters)`:** Extracts state partitions matching the filters. Unlike `split`, filters don't need to be exhaustive; unmatched variables are simply ignored. If multiple filters are given, returns a tuple of states.
+*   **`nnx.pop(module_or_state, *filters)`:** Similar to `nnx.state`, but *removes* the matched variables from the original module/state in-place. Useful for removing temporary state like `nnx.Intermediate`.
+*   **`nnx.update(module, state, *states)`:** Filters aren't passed directly, but the structure of the `state` (often created using `nnx.state` or modified after `nnx.split`) determines which variables in the `module` get updated.
+*   **`nnx.grad` / `nnx.value_and_grad`:** Filters specify which parts of the input arguments are differentiated. Uses `nnx.DiffState(argnum, filter)` where the filter defaults to `nnx.Param`.
+    ```python
+    # Differentiate wrt arg 0, only for Params containing 'kernel'
+    diff_kernel = nnx.DiffState(0, nnx.All(nnx.Param, nnx.PathContains('kernel')))
+    grads = nnx.grad(loss_fn, argnums=diff_kernel)(model, x, y)
+    ```
+*   **`nnx.vmap` / `nnx.scan`:** Filters specify how state variables are handled across the mapped/scanned dimension (mapped, broadcasted, carried over). Uses `nnx.StateAxes({filter: axis, ...})`.
+    ```python
+    # In vmap, map Params along axis 0, broadcast BatchStats
+    vmap_axes = nnx.StateAxes({nnx.Param: 0, nnx.BatchStat: None}) 
+    batched_model = nnx.vmap(model_fn, in_axes=(vmap_axes, 0))(model, batched_x)
+    ```
+
+## Internal Implementation Insights (`filterlib.py`)
+
+The core logic resides in `flax.nnx.filterlib`.
+
+**High-Level Walkthrough (`nnx.split` with filters):**
+
+1.  **Filter Conversion:** `nnx.split` calls `filters_to_predicates` which maps each filter literal (e.g., `nnx.Param`, `'tag'`, `True`) to its corresponding predicate object (`OfType`, `WithTag`, `Everything`) via `to_predicate`.
+2.  **State Flattening:** The input module/state is flattened into a `FlatState`, which is essentially a sorted list of `(PathParts, VariableState)` pairs.
+3.  **Predicate Application:** The code iterates through the flattened state. For each `(path, value)` pair, it checks the predicates one by one.
+4.  **Partitioning:** The pair is added to the list corresponding to the *first* predicate that returns `True`. If no predicate matches (and the last filter isn't `...`/`True`), it might go into a remainder partition or raise an error depending on the function (`split` requires exhaustive, `state` doesn't).
+5.  **State Reconstruction:** The partitioned lists of pairs are converted back into nested `State` objects using `statelib.from_flat_state`.
+
+**Sequence Diagram (`nnx.split(model, nnx.Param, ...)`):**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Split as nnx.split
+    participant FilterLib as filterlib
+    participant Graph as graph.flatten
+    participant StateLib as statelib
+    participant PredParam as OfType(Param)
+    participant PredRest as Everything
+
+    User->>Split: nnx.split(model, nnx.Param, ...)
+    activate Split
+    Split->>FilterLib: filters_to_predicates((nnx.Param, ...))
+    activate FilterLib
+    FilterLib->>PredParam: Create OfType(nnx.Param)
+    FilterLib->>PredRest: Create Everything()
+    FilterLib-->>Split: Return (predicate_param, predicate_rest)
+    deactivate FilterLib
+    Split->>Graph: flatten(model)
+    activate Graph
+    Graph-->>Split: Return (graphdef, flat_state)
+    deactivate Graph
+    Split->>Split: Initialize partitions: params=[], rest=[]
+    loop For (path, value) in flat_state
+        Split->>PredParam: predicate_param(path, value)?
+        activate PredParam
+        PredParam-->>Split: True / False
+        deactivate PredParam
+        alt Matches Param Filter
+            Split->>Split: Add (path, value) to params list
+        else Matches Rest Filter (...)
+            Split->>PredRest: predicate_rest(path, value)? (Always True)
+            activate PredRest
+            PredRest-->>Split: True
+            deactivate PredRest
+            Split->>Split: Add (path, value) to rest list
+        end
+    end
+    Split->>StateLib: from_flat_state(params)
+    activate StateLib
+    StateLib-->>Split: Return params_state
+    deactivate StateLib
+    Split->>StateLib: from_flat_state(rest)
+    activate StateLib
+    StateLib-->>Split: Return rest_state
+    deactivate StateLib
+    Split-->>User: Return (graphdef, params_state, rest_state)
+    deactivate Split
+```
+
+**Filter Classes (`flax/nnx/filterlib.py`):**
+
+The core filters are implemented as simple classes (often dataclasses) with a `__call__` method implementing the predicate logic.
+
+```python
+# Simplified view from flax/nnx/filterlib.py
+
+@dataclasses.dataclass(frozen=True)
+class OfType:
+  type: type
+  def __call__(self, path: PathParts, x: tp.Any):
+    # Checks isinstance OR if x has a .type attr that is subclass
+    return isinstance(x, self.type) or (
+      hasattr(x, 'type') and issubclass(x.type, self.type)
+    )
+
+@dataclasses.dataclass(frozen=True)
+class WithTag:
+  tag: str
+  def __call__(self, path: PathParts, x: tp.Any):
+    # Checks if x has a .tag attr equal to self.tag
+    return hasattr(x, 'tag') and x.tag == self.tag
+
+@dataclasses.dataclass(frozen=True)
+class PathContains:
+  key: Key
+  def __call__(self, path: PathParts, x: tp.Any):
+    return self.key in path
+
+class Any:
+  def __init__(self, *filters: Filter):
+    self.predicates = tuple(to_predicate(f) for f in filters)
+  def __call__(self, path: PathParts, x: tp.Any):
+    return any(p(path, x) for p in self.predicates)
+
+# ... All, Not, Everything, Nothing defined similarly ...
+
+def to_predicate(filter: Filter) -> Predicate:
+  if isinstance(filter, str):
+    return WithTag(filter)
+  elif isinstance(filter, type):
+    return OfType(filter)
+  # ... other cases ...
+  elif isinstance(filter, (list, tuple)):
+    return Any(*filter)
+  # ...
+```
+
+## Conclusion
+
+Filters (`filterlib`) are an indispensable tool in Flax NNX for precisely selecting parts of a model's state. By providing a flexible specification language based on variable types, tags, paths, custom functions, and logical combinations, filters enable targeted operations within the functional API (`nnx.split`, `nnx.state`, `nnx.pop`) and lifted transforms (`nnx.grad`, `nnx.vmap`, etc.). Understanding filters is key to effectively managing and transforming complex NNX models.
+
+In the next chapter, we will see how these filters, along with the functional API, are leveraged by [NNX Lifted Transforms (jit, grad, vmap, scan, etc.)](nnx_lifted_transforms__jit__grad__vmap__scan__etc__.mdc) to apply JAX transformations directly to `nnx.Module` methods.
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

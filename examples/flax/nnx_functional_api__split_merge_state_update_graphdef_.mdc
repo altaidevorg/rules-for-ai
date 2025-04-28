@@ -1,0 +1,334 @@
+---
+description: Explains the Flax NNX Functional API (split, merge, state, update, graphdef) for bridging stateful Modules and JAX's functional paradigm.
+globs: 
+alwaysApply: false
+---
+# Chapter 6: NNX Functional API (split/merge/state/update/graphdef)
+
+In the [previous chapter](nnx_lifted_transforms__jit__grad__vmap__scan__etc__.mdc), we saw how NNX Lifted Transforms like `nnx.jit` and `nnx.grad` automatically handle the state management required to apply JAX transformations to stateful `nnx.Module` methods. This chapter dives into the fundamental building blocks that make those lifted transforms possible: the NNX Functional API. This set of functions (`nnx.split`, `nnx.merge`, `nnx.state`, `nnx.update`, `nnx.graphdef`) provides the explicit bridge between NNX's object-oriented, stateful `nnx.Module` instances and JAX's functional programming model which requires pure functions operating on immutable pytrees.
+
+## Motivation: Manual Control over State for JAX Interoperability
+
+JAX transformations operate on pure functions and immutable data structures (pytrees). [nnx.Module](nnx_module.mdc) instances, however, are stateful Python objects containing mutable [nnx.Variable / nnx.VariableState](nnx_variable___nnx_variablestate.mdc) attributes. To apply a JAX transform like `jax.jit` or `jax.grad` directly, we need to:
+
+1.  **Separate** the static, structural information of the Module (its class types, attribute names, nested structure) from its dynamic state (the actual values held in Variables).
+2.  Define a **pure function** that accepts the dynamic state as an explicit argument (a JAX pytree).
+3.  **Apply** the JAX transformation to this pure function.
+4.  Potentially **recombine** the static structure and the (possibly updated) dynamic state to get a Module instance back.
+
+While Lifted Transforms automate this, the Functional API provides the manual controls (`split`, `merge`, etc.) to perform these steps explicitly. Understanding this API is crucial for advanced use cases, debugging, and comprehending how NNX integrates with JAX at a fundamental level.
+
+## Central Use Case: Manual JIT Compilation of a Module Method
+
+Let's manually JIT-compile a method of an `nnx.Module` using the functional API. Compare this to the automated approach shown with `nnx.jit` in the previous chapter.
+
+```python
+import jax
+import jax.numpy as jnp
+from flax import nnx
+
+class Counter(nnx.Module):
+  def __init__(self):
+    self.count = nnx.Variable(0)
+
+  def increment(self, amount: int = 1):
+    self.count.value += amount
+    # Note: No need to return self here for this functional approach
+
+# Instantiate the stateful module
+counter_obj = Counter()
+
+# 1. Define a PURE function operating on state
+#    It takes GraphDef (static) and State (dynamic) + other args
+def pure_increment_fn(graphdef: nnx.GraphDef, state: nnx.State, amount: int):
+  # Temporarily reconstruct the module inside the pure function
+  module = nnx.merge(graphdef, state)
+  # Call the original method
+  module.increment(amount)
+  # Split the potentially updated module back into GraphDef/State
+  # We only need the updated state to return
+  _, updated_state = nnx.split(module) 
+  return updated_state # Return only the dynamic state
+
+# 2. Apply jax.jit to the PURE function
+#    GraphDef is static, so mark it as such
+jitted_pure_increment = jax.jit(pure_increment_fn, static_argnums=(0,))
+
+# --- Execution ---
+# 3. Split the initial module instance
+initial_graphdef, initial_state = nnx.split(counter_obj)
+print(f"Initial state: {initial_state}")
+
+# 4. Call the jitted pure function with the state
+updated_state = jitted_pure_increment(initial_graphdef, initial_state, 5)
+print(f"Updated state: {updated_state}")
+
+# 5. Merge back to get an updated instance (optional)
+updated_counter_obj = nnx.merge(initial_graphdef, updated_state)
+print(f"Value in new object: {updated_counter_obj.count.value}")
+
+# The original object remains unchanged
+print(f"Value in original object: {counter_obj.count.value}") 
+```
+
+**Example Output:**
+```
+Initial state: State({'count': VariableState(type=Variable, value=0)})
+Updated state: State({'count': VariableState(type=Variable, value=5)})
+Value in new object: 5
+Value in original object: 0 
+```
+
+This example illustrates the manual workflow:
+1.  **`split`:** Separates `counter_obj` into `initial_graphdef` (structure) and `initial_state` (value `0`).
+2.  **Pure Function:** `pure_increment_fn` takes `graphdef` and `state` explicitly.
+3.  **`merge`:** Inside the pure function, `nnx.merge` reconstructs a temporary `module` instance.
+4.  **`split` (again):** After mutation, `nnx.split` extracts the `updated_state` (value `5`).
+5.  **`jax.jit`:** Compiles `pure_increment_fn`. Note `static_argnums=(0,)` tells JIT that `graphdef` is static and won't change, which is crucial for compilation caching.
+6.  **Execution:** The jitted function is called with the initial state, producing the updated state.
+7.  **`merge` (final):** Optionally merge back to get a new module instance reflecting the update.
+
+This contrasts with `nnx.jit` which hides steps 1, 3, 4, and 5 from the user.
+
+## Key Concepts: The Functional API Functions
+
+Let's examine each function in detail.
+
+### `nnx.split(module, *filters)`
+
+*   **Purpose:** Separates an `nnx.Module` instance (or a pytree containing modules/variables) into its static structure (`GraphDef`) and dynamic state (`State`).
+*   **Inputs:**
+    *   `module`: The `nnx.Module` instance or compatible pytree.
+    *   `*filters` (optional): One or more [Filters (`filterlib`)](filters___filterlib__.mdc) (e.g., `nnx.Param`, `nnx.BatchStat`, `'dropout'`). If provided, the state is partitioned.
+*   **Outputs:**
+    *   `graphdef`: An `nnx.GraphDef` object representing the static structure. It's hashable and suitable for JAX's static arguments. See [Graph Representation (GraphDef / GraphState)](graph_representation__graphdef___graphstate_.mdc).
+    *   `state`: An `nnx.State` object (a pytree). If no filters are given, it contains all dynamic state. If filters are provided, returns multiple `State` objects, one for each filter partition. The leaves of the `State` pytree are `nnx.VariableState` objects, which are immutable snapshots of the `nnx.Variable` values.
+*   **Mechanism:** Traverses the module, converting each `nnx.Variable` instance into an `nnx.VariableState` containing its type, value, and metadata. It builds the `GraphDef` reflecting the module hierarchy and attribute types.
+
+```python
+from flax import nnx
+
+class Model(nnx.Module):
+  def __init__(self, *, rngs: nnx.Rngs):
+    self.layer1 = nnx.Linear(2, 4, rngs=rngs)
+    self.bn = nnx.BatchNorm(4, use_running_average=False, rngs=rngs)
+
+model = Model(rngs=nnx.Rngs(0))
+
+# Split without filters
+graphdef, full_state = nnx.split(model)
+print("Full State Structure (types shown):")
+print(jax.tree.map(lambda x: type(x).__name__, full_state, is_leaf=lambda x: isinstance(x, nnx.VariableState)))
+# Output: State({'bn': State({'bias': 'VariableState', 'mean': 'VariableState', ...}), 'layer1': ...})
+
+# Split with filters
+graphdef_f, params_state, bn_state, other_state = nnx.split(
+    model, nnx.Param, nnx.BatchStat, ...
+)
+print("\nParam State Structure:")
+print(jax.tree.map(lambda x: type(x).__name__, params_state, is_leaf=lambda x: isinstance(x, nnx.VariableState)))
+# Output: State({'bn': State({'bias': 'VariableState', 'scale': 'VariableState'}), 'layer1': ...}) 
+print("\nBatchStat State Structure:")
+print(jax.tree.map(lambda x: type(x).__name__, bn_state, is_leaf=lambda x: isinstance(x, nnx.VariableState)))
+# Output: State({'bn': State({'mean': 'VariableState', 'var': 'VariableState'})}) 
+```
+
+### `nnx.merge(graphdef, *states)`
+
+*   **Purpose:** Reconstructs an `nnx.Module` instance from its static `GraphDef` and one or more dynamic `State` objects. The inverse of `nnx.split`.
+*   **Inputs:**
+    *   `graphdef`: The `nnx.GraphDef` obtained from `nnx.split`.
+    *   `*states`: One or more `nnx.State` objects. If `split` produced multiple states using filters, they must be passed here in the *same order*. The combined leaves across all states must match the structure expected by the `graphdef`.
+*   **Output:** A *new* `nnx.Module` instance mirroring the original structure but populated with the values from the provided `State`(s).
+*   **Mechanism:** Uses the `GraphDef` to build the module structure. Traverses the `State`(s), converting each `nnx.VariableState` leaf back into a corresponding `nnx.Variable` instance (of the correct type) and assigning it as an attribute on the reconstructed module.
+
+```python
+# Continuing previous example...
+graphdef, params_state, bn_state, other_state = nnx.split(
+    model, nnx.Param, nnx.BatchStat, ...
+)
+
+# Modify a parameter value in the state (pure operation)
+updated_params_state = jax.tree.map(
+    lambda x: x.replace(x.value * 0.9) if isinstance(x, nnx.VariableState) else x,
+    params_state,
+    is_leaf=lambda x: isinstance(x, nnx.VariableState)
+)
+
+# Reconstruct the model with the updated parameters
+# State order must match the split order
+reconstructed_model = nnx.merge(graphdef, updated_params_state, bn_state, other_state)
+
+# Verify the change in the new model instance
+print("\nOriginal kernel norm:", jnp.linalg.norm(model.layer1.kernel.value))
+print("Reconstructed kernel norm:", jnp.linalg.norm(reconstructed_model.layer1.kernel.value)) 
+# Output shows reconstructed norm is 0.9 * original norm
+```
+
+### `nnx.state(module, *filters)`
+
+*   **Purpose:** Extracts the dynamic `State` from a module, similar to `nnx.split`, but *without* returning the `GraphDef`.
+*   **Inputs:**
+    *   `module`: The `nnx.Module` instance or compatible pytree.
+    *   `*filters` (optional): Filters to select or partition the state.
+*   **Outputs:**
+    *   `state`: An `nnx.State` object (or tuple of `State` objects if multiple filters are used). Contains `nnx.VariableState` leaves corresponding to the `nnx.Variable` attributes matching the filters.
+*   **Use Case:** Useful when you only need the state values (e.g., for logging, saving, or applying updates) and don't need the static structure.
+
+```python
+# Continuing previous example...
+
+# Extract only parameters
+params_only = nnx.state(model, nnx.Param)
+print("\nExtracted Param State only:")
+print(params_only)
+
+# Extract parameters and batch stats into separate states
+params_part, bn_part = nnx.state(model, nnx.Param, nnx.BatchStat)
+print("\nExtracted BN State separately:")
+print(bn_part)
+```
+
+### `nnx.update(module, *states)`
+
+*   **Purpose:** Updates the state of an *existing* `nnx.Module` instance in-place using values from one or more `State` objects.
+*   **Inputs:**
+    *   `module`: The `nnx.Module` instance to be updated *in-place*.
+    *   `*states`: One or more `nnx.State` objects containing `nnx.VariableState` leaves. The paths in the state(s) must correspond to attributes in the `module`.
+*   **Output:** `None`. The update happens in-place.
+*   **Mechanism:** Traverses the provided `State`(s). For each `VariableState` leaf found, it locates the corresponding `nnx.Variable` attribute in the `module` (matching the path) and updates its `raw_value` with the `value` from the `VariableState`.
+
+```python
+# Continuing previous example...
+print(f"\nOriginal model bias before update: {model.layer1.bias.value}")
+
+# Create a state object representing new bias values
+new_bias_value = jnp.ones_like(model.layer1.bias.value)
+update_state = nnx.State({'layer1': {'bias': nnx.VariableState(nnx.Param, new_bias_value)}})
+
+# Update the original model instance in-place
+nnx.update(model, update_state) 
+
+print(f"Original model bias after update: {model.layer1.bias.value}")
+# Output: Original model bias after update: [1. 1. 1. 1.] 
+```
+Note the key difference: `nnx.update` modifies the passed `module`, while `nnx.merge` returns a new instance.
+
+### `nnx.graphdef(module)`
+
+*   **Purpose:** Extracts *only* the static `GraphDef` from a module.
+*   **Input:** `module`: The `nnx.Module` instance or compatible pytree.
+*   **Output:** `graphdef`: The `nnx.GraphDef` object.
+*   **Use Case:** Useful when you only need the static structure, perhaps for analysis or caching purposes, without extracting the state values.
+
+```python
+# Continuing previous example...
+static_structure = nnx.graphdef(model)
+print(f"\nExtracted GraphDef (summary): {type(static_structure)}") 
+# Output: Extracted GraphDef (summary): <class 'flax.nnx.graph.GraphDef'>
+# print(static_structure) would show the detailed structure definition.
+```
+
+## Relationship between GraphDef and State
+
+The `split`/`merge` mechanism fundamentally relies on the separation of concerns:
+
+*   **`nnx.GraphDef`**: Represents the *static* part of the module. This includes:
+    *   The Python types of the module and its nested submodules.
+    *   The names and order of attributes.
+    *   Which attributes are Variables, other Modules, or static Python values.
+    *   For Variables: their type (`nnx.Param`, `nnx.BatchStat`, etc.) and any static metadata.
+    *   It does *not* contain the actual numerical values of Variables.
+    *   `GraphDef` is hashable and treated as static by JAX transformations (important for `jax.jit` caching).
+
+*   **`nnx.State`**: Represents the *dynamic* part of the module. This is:
+    *   A JAX pytree (typically nested dictionaries mirroring the module structure).
+    *   The leaves of this pytree are `nnx.VariableState` objects.
+    *   Each `VariableState` holds the actual *value* (e.g., a JAX array) of a corresponding `nnx.Variable` in the original module, along with its type and metadata.
+    *   JAX transformations trace operations on the `value` fields within the `VariableState` leaves.
+
+This clear separation allows JAX to work its magic on the dynamic `State` pytree while treating the `GraphDef` as a constant part of the function's definition. More details on the specific structure are in [Graph Representation (GraphDef / GraphState)](graph_representation__graphdef___graphstate_.mdc).
+
+## Internal Implementation Insights
+
+The core logic resides in `flax.nnx.graph` and `flax.nnx.statelib`.
+
+**`nnx.split` (Simplified Flow):**
+1.  **`flatten`:** Calls `graph.flatten(node)`. This function performs a graph traversal starting from the root `node`.
+2.  **Reference Tracking:** It maintains a `RefMap` to track visited nodes (Modules and Variables) to handle shared references correctly (e.g., weight sharing). If a node is revisited, a `NodeRef` is added to the `GraphDef` instead of retraversing.
+3.  **Node Processing:** For each new node encountered:
+    *   If it's a `Variable`, create a `VariableDef` (containing type, metadata) and add its `nnx.VariableState` (containing the value) to the list of leaves (`FlatState`).
+    *   If it's a Module, create a `NodeDef` (containing type, metadata) and recursively process its attributes. Static attributes are embedded directly in the `GraphDef`, while Array attributes become leaves in the `FlatState`.
+4.  **Output:** Returns the assembled `GraphDef` and the `FlatState` (a flat list of `(path, value)` pairs).
+5.  **Partitioning (if filters):** If filters are provided, `_split_state` partitions the `FlatState` based on the filter predicates.
+6.  **Nesting:** `statelib.from_flat_state` converts the flat list(s) back into nested `State` object(s).
+
+**`nnx.merge` (Simplified Flow):**
+1.  **State Consolidation:** Merges the input `State` objects into a single flat list of values (`_merge_to_flat_state`).
+2.  **`unflatten`:** Calls `graph.unflatten(graphdef, flat_state_leaves)`. This function drives the reconstruction.
+3.  **Reference Tracking:** Maintains an `IndexMap` to store reconstructed nodes, allowing `NodeRef` entries in the `GraphDef` to correctly link to already created instances.
+4.  **GraphDef Traversal:** Iterates through the `GraphDef` nodes and attributes.
+5.  **Node Creation/Update:**
+    *   If a `NodeRef` is encountered, retrieves the existing node from `IndexMap`.
+    *   If a `VariableDef` is encountered, consumes the next leaf from the state list, creates a new `Variable` instance of the specified type with the value and metadata, and stores it in `IndexMap`.
+    *   If a `NodeDef` is encountered, creates an empty instance (if GraphNode) or prepares for creation (if PytreeNode), stores it in `IndexMap`, and recursively calls `_graph_unflatten` for its children attributes, populating the instance. PytreeNodes are created after their children.
+6.  **Output:** Returns the fully reconstructed root node.
+
+**Sequence Diagram (`split` then `merge`):**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Split as nnx.split
+    participant Flatten as graph.flatten
+    participant Module as nnx.Module Instance
+    participant Var as nnx.Variable Attribute
+    participant VState as nnx.VariableState
+    participant StateLib as statelib
+    participant Merge as nnx.merge
+    participant Unflatten as graph.unflatten
+
+    User->>Split: nnx.split(module_obj)
+    activate Split
+    Split->>Flatten: flatten(module_obj)
+    activate Flatten
+    Flatten->>Module: Traverse attributes
+    Flatten->>Var: Process Variable
+    Var->>VState: Create VariableState
+    Flatten-->>Split: Return (graphdef, flat_state)
+    deactivate Flatten
+    Split->>StateLib: from_flat_state(flat_state)
+    activate StateLib
+    StateLib-->>Split: Return nested_state
+    deactivate StateLib
+    Split-->>User: Return (graphdef, nested_state)
+    deactivate Split
+
+    User->>Merge: nnx.merge(graphdef, nested_state)
+    activate Merge
+    Merge->>StateLib: flatten_to_sequence(nested_state)
+    activate StateLib
+    StateLib-->>Merge: Return flat_state_leaves
+    deactivate StateLib
+    Merge->>Unflatten: unflatten(graphdef, flat_state_leaves)
+    activate Unflatten
+    Unflatten->>Unflatten: Traverse GraphDef
+    Unflatten->>VState: Get value from leaf
+    VState->>Var: Create Variable instance
+    Unflatten->>Module: Create Module instance(s) & assign attributes
+    Unflatten-->>Merge: Return reconstructed_module
+    deactivate Unflatten
+    Merge-->>User: Return reconstructed_module
+    deactivate Merge
+```
+
+## Conclusion
+
+The NNX Functional API (`split`, `merge`, `state`, `update`, `graphdef`) provides the essential low-level tools for converting between NNX's stateful object representation and JAX's required functional, state-explicit paradigm. `split` separates structure (`GraphDef`) from data (`State`), while `merge` recombines them. `state` extracts only the data, `update` modifies an existing object's data in-place, and `graphdef` extracts only the structure. While often automated by [NNX Lifted Transforms (jit, grad, vmap, scan, etc.)](nnx_lifted_transforms__jit__grad__vmap__scan__etc__.mdc), understanding this API is fundamental to grasping NNX's core mechanics and enabling advanced interoperability with JAX.
+
+In the next chapter, we'll look more closely at the structure and properties of the objects produced by this API: [Graph Representation (GraphDef / GraphState)](graph_representation__graphdef___graphstate_.mdc).
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

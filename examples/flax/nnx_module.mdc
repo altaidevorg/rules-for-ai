@@ -1,0 +1,280 @@
+---
+description: Explains the core Flax NNX abstraction nnx.Module for defining neural network components as stateful Python classes.
+globs: 
+alwaysApply: true
+---
+# Chapter 1: nnx.Module
+
+Welcome to the Flax NNX tutorial! This first chapter introduces the cornerstone of building neural networks with NNX: `nnx.Module`.
+
+## Motivation: Pythonic Neural Networks in JAX
+
+JAX provides powerful tools for accelerated numerical computing, particularly automatic differentiation and compilation (XLA). However, its functional nature can sometimes make defining and managing the state (parameters, batch statistics, etc.) of complex neural networks cumbersome.
+
+Traditional Flax (Linen) addressed this with a functional API built around `nn.Module`, which required special methods (`setup`, `compact`) and external state management.
+
+Flax NNX introduces `nnx.Module` to offer a more intuitive, object-oriented approach. The core idea is simple: **define your network layers and models as standard Python classes.** State is held directly as instance attributes, initialization happens in `__init__`, and forward computation is defined in regular methods (like `__call__`). This leverages familiar Python principles, simplifying debugging, inspection, and overall development workflow, while still integrating seamlessly with JAX's functional transformations through helper APIs.
+
+## Central Use Case: Defining a Simple Linear Layer
+
+Let's see how `nnx.Module` works by defining a basic linear transformation layer.
+
+```python
+import jax
+import jax.numpy as jnp
+from flax import nnx
+from flax.nnx.nn import initializers # For parameter initialization
+
+# Define needed RNGs for initialization
+rngs = nnx.Rngs(0)
+
+class SimpleLinear(nnx.Module):
+  def __init__(self, in_features: int, out_features: int, *, rngs: nnx.Rngs):
+    # Define state (parameters) directly as attributes
+    # We use nnx.Param, a type of nnx.Variable, to mark learnable parameters
+    self.kernel = nnx.Param(
+        initializers.lecun_normal()(rngs.params(), (in_features, out_features))
+    )
+    self.bias = nnx.Param(initializers.zeros_init()(rngs.params(), (out_features,)))
+
+  def __call__(self, x: jax.Array) -> jax.Array:
+    # Access state attributes directly in forward computation
+    y = jnp.dot(x, self.kernel.value) + self.bias.value
+    return y
+
+# Instantiate the layer like a regular Python class
+layer = SimpleLinear(in_features=3, out_features=4, rngs=rngs)
+
+# Create dummy input data
+x = jnp.ones((1, 3))
+
+# Call the layer instance directly
+y = layer(x)
+
+print(f"Output shape: {y.shape}")
+# Output: Output shape: (1, 4)
+```
+
+In this example:
+1.  We subclass `nnx.Module`.
+2.  In `__init__`, we initialize parameters (`kernel`, `bias`) using standard initializers and wrap them in `nnx.Param`. `nnx.Param` is a special type of [nnx.Variable / nnx.VariableState](nnx_variable___nnx_variablestate.mdc), signifying a learnable parameter. We need an [nnx.Rngs](nnx_rngs.mdc) object for generating the random keys required by initializers.
+3.  The forward logic is defined in `__call__`. We access the parameter values directly using `self.kernel.value` and `self.bias.value`.
+4.  Instantiation and calling follow standard Python object-oriented patterns.
+
+## Key Concepts
+
+Let's break down the essential aspects of `nnx.Module`:
+
+1.  **Standard Python Class:** At its heart, an `nnx.Module` *is* a Python class. You use standard `__init__` for setup, define methods like `__call__` for computation, and access attributes using `self.attribute_name`. This makes the structure familiar and easy to reason about.
+
+2.  **Stateful Attributes with `nnx.Variable`:** Unlike purely functional approaches where state is passed explicitly, `nnx.Module` holds its state (parameters, batch statistics, optimizer states, intermediate values) directly as instance attributes. These stateful attributes are typically instances of [nnx.Variable / nnx.VariableState](nnx_variable___nnx_variablestate.mdc) subtypes (like `nnx.Param`, `nnx.BatchStat`). This explicit wrapping allows the NNX framework to track and manage the state effectively.
+
+    ```python
+    class MyModule(nnx.Module):
+        def __init__(self, din, dout, *, rngs: nnx.Rngs):
+            # Parameter state
+            self.weight = nnx.Param(jax.random.normal(rngs.params(), (din, dout)))
+            # Non-parameter state (e.g., for BatchNorm)
+            self.running_mean = nnx.BatchStat(jnp.zeros((dout,)))
+            # Regular Python attribute (not tracked as state by default)
+            self.dropout_rate = 0.5
+    ```
+
+3.  **Nesting:** Modules can contain other modules as attributes. This allows you to build complex models by composing simpler components, forming a natural tree structure.
+
+    ```python
+    from flax.nnx.nn import Linear # Use pre-built Linear layer
+
+    class MLP(nnx.Module):
+      def __init__(self, din: int, dmid: int, dout: int, *, rngs: nnx.Rngs):
+        # Nesting pre-built nnx.Linear modules
+        self.linear1 = Linear(din, dmid, rngs=rngs)
+        self.linear2 = Linear(dmid, dout, rngs=rngs)
+
+      def __call__(self, x: jax.Array):
+        x = self.linear1(x)
+        x = nnx.relu(x) # Apply activation function
+        x = self.linear2(x)
+        return x
+
+    # Instantiate the MLP
+    mlp = MLP(din=10, dmid=20, dout=5, rngs=nnx.Rngs(1))
+    print(mlp)
+    # Output will show the nested structure:
+    # MLP(
+    #   # ... (internal state info)
+    #   linear1=Linear(...),
+    #   linear2=Linear(...)
+    # )
+    ```
+    NNX automatically discovers nested modules and variables within them.
+
+4.  **Separation of State and Structure (GraphDef/State):** Although `nnx.Module` instances are stateful Python objects, NNX provides a functional API ([NNX Functional API (split/merge/state/update/graphdef)](nnx_functional_api__split_merge_state_update_graphdef_.mdc)) to separate the static structure (GraphDef) from the dynamic state (State).
+
+    *   `nnx.split(module)`: Extracts the `GraphDef` (the class structure, attribute names, types) and the `State` (the actual values of all `nnx.Variable` attributes) from a module instance or tree.
+    *   `nnx.merge(graphdef, state)`: Reconstructs the module instance(s) from a `GraphDef` and `State`.
+
+    This separation is crucial for integrating with JAX. JAX transformations like `jax.jit` or `jax.grad` require pure functions that operate on explicit state. The [NNX Lifted Transforms (jit, grad, vmap, scan, etc.)](nnx_lifted_transforms__jit__grad__vmap__scan__etc__.mdc) (`nnx.jit`, `nnx.grad`) automatically handle this splitting and merging under the hood, allowing you to apply JAX transformations directly to methods of your stateful `nnx.Module`.
+
+## Internal Implementation Insights
+
+Understanding how `nnx.Module` works internally helps in advanced use cases and debugging.
+
+**High-Level Walkthrough:**
+
+1.  **Inheritance:** `nnx.Module` inherits from `flax.nnx.object.Object`. This base class provides the core machinery for attribute tracking.
+2.  **Metaclass Magic:** `ObjectMeta` intercepts the class creation process (`__call__` on the metaclass). When you instantiate an `nnx.Module` (e.g., `MyModule()`), it first creates the object instance (`__new__`) and then initializes a special internal attribute `_object__state` (an `ObjectState` instance) before calling the class's `__init__`.
+3.  **Attribute Assignment:** When you assign an attribute within `__init__` or later (e.g., `self.linear1 = Linear(...)`), the `Object.__setattr__` method (or rather, `_setattr`) is invoked. If the assigned value is an `nnx.Variable` or another `nnx.Module` (or certain other trackable types), it gets registered within NNX's internal graph tracking system. Regular Python objects are assigned normally.
+4.  **State Access:** Accessing attributes (e.g., `self.linear1(x)` or `self.kernel.value`) works like standard Python. The `.value` property on `nnx.Variable` retrieves the underlying JAX array or value.
+5.  **Graph Structure:** NNX maintains an internal representation of the nested module structure and associated variables, which is formalized as the [Graph Representation (GraphDef / GraphState)](graph_representation__graphdef___graphstate_.mdc).
+
+**Instantiation and Call Flow Diagram:**
+
+```mermaid
+sequenceDiagram
+    participant UC as User Code
+    participant MLP as MLP(nnx.Module)
+    participant Lin as nnx.Linear
+    participant Par as nnx.Param (Variable)
+    participant NXM as NNX Graph/State Mgmt
+
+    UC->>MLP: Instantiate MLP(..., rngs)
+    activate MLP
+    MLP->>Lin: Instantiate linear1(..., rngs)
+    activate Lin
+    Lin->>Par: Create kernel Param
+    activate Par
+    Par-->>NXM: Register kernel Variable
+    deactivate Par
+    Lin->>Par: Create bias Param
+    activate Par
+    Par-->>NXM: Register bias Variable
+    deactivate Par
+    Lin-->>MLP: Return linear1 instance
+    deactivate Lin
+    MLP->>NXM: Register linear1 as child attribute
+    MLP->>Lin: Instantiate linear2(..., rngs)
+    activate Lin
+    %% ... similar param creation/registration ... %%
+    Lin-->>MLP: Return linear2 instance
+    deactivate Lin
+    MLP->>NXM: Register linear2 as child attribute
+    MLP-->>UC: Return MLP instance
+    deactivate MLP
+
+    UC->>MLP: Call mlp_instance(x)
+    activate MLP
+    MLP->>Lin: Call linear1(x)
+    activate Lin
+    Lin->>Par: Access kernel.value
+    Lin->>Par: Access bias.value
+    %% ... computation ... %%
+    Lin-->>MLP: Return result1
+    deactivate Lin
+    MLP->>Lin: Call linear2(result1)
+    activate Lin
+    Lin->>Par: Access kernel.value
+    Lin->>Par: Access bias.value
+    %% ... computation ... %%
+    Lin-->>MLP: Return result2
+    deactivate Lin
+    MLP-->>UC: Return final result
+    deactivate MLP
+```
+
+**Code References (`flax/nnx/module.py`, `flax/nnx/object.py`):**
+
+*   `nnx.Module` inherits from `nnx.Object`.
+*   `nnx.ObjectMeta` manages instance creation and setup of `_object__state`.
+*   `nnx.Object._setattr` handles attribute assignments, checking types and potentially registering them with the graph system.
+*   `nnx.Module` adds methods like `iter_modules`, `iter_children`, `sow`, `perturb`, `train`, `eval`, `set_attributes`.
+
+```python
+# Simplified view from flax/nnx/module.py
+class Module(Object, metaclass=ModuleMeta):
+    # ... (methods like sow, perturb, etc.)
+
+    def iter_modules(self) -> tp.Iterator[tuple[PathParts, 'Module']]:
+        # Uses graph.iter_graph internally
+        for path, value in graph.iter_graph(self):
+            if isinstance(value, Module):
+                yield path, value
+
+    def train(self, **attributes):
+        # Sets standard training flags like deterministic=False
+        return self.set_attributes(
+            deterministic=False,
+            use_running_average=False,
+            # ... other attributes ...
+        )
+
+    def eval(self, **attributes):
+        # Sets standard evaluation flags like deterministic=True
+        return self.set_attributes(
+            deterministic=True,
+            use_running_average=True,
+            # ... other attributes ...
+        )
+
+    # Optional PyTree registration via __init_subclass__
+    def __init_subclass__(cls, experimental_pytree: bool = False) -> None:
+        super().__init_subclass__()
+        if experimental_pytree:
+            jtu.register_pytree_with_keys(
+                cls,
+                partial(_module_flatten, with_keys=True), # Uses nnx.split
+                _module_unflatten, # Uses nnx.merge
+                # ...
+            )
+```
+The `experimental_pytree` option allows treating `nnx.Module` instances directly as JAX PyTrees, useful for certain advanced manual JAX integrations, but the standard way is via the lifted transforms.
+
+## Additional `nnx.Module` Methods
+
+Besides `__init__` and `__call__`, `nnx.Module` provides several helpful methods:
+
+*   `sow(variable_type, name, value, ...)`: Used to store intermediate activations during the forward pass. Useful for debugging or analysis. Creates a new attribute `name` of the specified `variable_type` (e.g., `nnx.Intermediate`).
+*   `perturb(name, value, ...)`: Adds a zero-valued variable (`nnx.Perturbation`) designed for obtaining intermediate gradients via backpropagation.
+*   `iter_modules()`: Recursively yields `(path, submodule)` for all modules in the tree (including self).
+*   `iter_children()`: Yields `(name, child_module)` for direct children only.
+*   `set_attributes(*filters, **attributes)`: Recursively sets attributes on modules matching the filters.
+*   `train()` / `eval()`: Convenience methods using `set_attributes` to toggle common modes (e.g., for `nnx.Dropout`, `nnx.BatchNorm`). They typically set `deterministic` and `use_running_average` flags.
+
+```python
+# Example using train/eval
+class TrainingBlock(nnx.Module):
+    def __init__(self, din, dout, *, rngs: nnx.Rngs):
+        self.linear = nnx.Linear(din, dout, rngs=rngs)
+        self.bn = nnx.BatchNorm(dout, use_running_average=False, rngs=rngs)
+        self.dropout = nnx.Dropout(0.5, deterministic=False, rngs=rngs)
+
+    def __call__(self, x):
+        x = self.linear(x)
+        x = self.bn(x) # Behavior depends on use_running_average
+        x = nnx.relu(x)
+        x = self.dropout(x) # Behavior depends on deterministic
+        return x
+
+block = TrainingBlock(10, 20, rngs=nnx.Rngs(0))
+print(f"Initial - BN use_running_average: {block.bn.use_running_average}, Dropout deterministic: {block.dropout.deterministic}")
+# Output: Initial - BN use_running_average: False, Dropout deterministic: False
+
+block.eval() # Switch to evaluation mode
+print(f"Eval - BN use_running_average: {block.bn.use_running_average}, Dropout deterministic: {block.dropout.deterministic}")
+# Output: Eval - BN use_running_average: True, Dropout deterministic: True
+
+block.train() # Switch back to training mode
+print(f"Train - BN use_running_average: {block.bn.use_running_average}, Dropout deterministic: {block.dropout.deterministic}")
+# Output: Train - BN use_running_average: False, Dropout deterministic: False
+```
+
+## Conclusion
+
+`nnx.Module` is the fundamental building block in Flax NNX. It provides an intuitive, object-oriented interface for defining neural network components by leveraging standard Python classes and attributes. State is managed explicitly using `nnx.Variable` types held as attributes. This approach simplifies model definition, inspection, and composition through nesting. Crucially, through the functional API (`nnx.split`/`nnx.merge`) and lifted transforms (`nnx.jit`/`nnx.grad`), these stateful objects integrate smoothly with JAX's functional ecosystem.
+
+In the next chapter, we will delve deeper into the core mechanism for state representation: [nnx.Variable / nnx.VariableState](nnx_variable___nnx_variablestate.mdc).
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

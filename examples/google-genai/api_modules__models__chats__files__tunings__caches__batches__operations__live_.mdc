@@ -1,0 +1,252 @@
+---
+description: Explains google-genai API Modules (Models, Chats, Files, etc.) - facades grouping related API actions accessed via the Client.
+globs: 
+alwaysApply: false
+---
+# Chapter 3: API Modules (Models, Chats, Files, Tunings, Caches, Batches, Operations, Live)
+
+In [Chapter 1: Client](client.mdc), we established the `Client` as the central configuration hub. In [Chapter 2: Content / Part](content___part.mdc), we learned how data is structured for model interaction. Now, we'll explore how the SDK organizes the *actions* you can perform with that data: through the API Modules.
+
+## Motivation and Use Case
+
+A generative AI API offers diverse functionalities beyond just generating text: managing models, handling files, tuning models, managing long-running jobs, etc. Exposing every single API call directly on the main `Client` object would lead to a cluttered and overwhelming interface.
+
+The API Modules (`Models`, `Chats`, `Files`, `Tunings`, `Caches`, `Batches`, `Operations`, `Live`, and their async counterparts) solve this by grouping related functionalities into logical units. Each module acts as a *Facade* for a specific subset of the API, providing a clean, organized way to access related operations.
+
+**Central Use Case:** Imagine you have a configured `Client` and want to perform several distinct tasks: list available generative models, upload a file for context, and start a chat session. Instead of searching through a monolithic client object, you interact with specific modules:
+
+```python
+# Assuming 'client' is configured (e.g., using genai.Client(api_key=...))
+from google import genai
+from google.genai import types
+
+# 1. List models using the 'models' module
+print("Available Models:")
+for model in client.models.list():
+    # We only care about the model name and description for this example
+    if "generateContent" in model.supported_generation_methods:
+        print(f"- {model.name}: {model.display_name}")
+
+# 2. Upload a file using the 'files' module (Gemini API only)
+# Create a dummy file for demonstration
+try:
+    with open("my_data.txt", "w") as f:
+        f.write("This is some data to be uploaded.")
+    # Check if the client is configured for Vertex AI
+    if not client.vertexai:
+        uploaded_file = client.files.upload(file='my_data.txt')
+        print(f"\nUploaded File: {uploaded_file.name} ({uploaded_file.uri})")
+        # You can now use uploaded_file object in generate_content
+    else:
+        print("\nFile API is not supported for Vertex AI client.")
+except Exception as e:
+    print(f"\nFile upload failed (or skipped): {e}")
+finally:
+    # Clean up dummy file
+    import os
+    if os.path.exists("my_data.txt"):
+        os.remove("my_data.txt")
+
+
+# 3. Create a chat session using the 'chats' module/factory
+# Note: client.chats acts like a factory for Chat instances
+chat_session = client.chats.create(model='gemini-1.5-flash') # Or an appropriate model
+print(f"\nCreated chat session using model: {chat_session._model}")
+# Further interaction would use chat_session.send_message(...)
+# See [Chat / AsyncChat](chat___asyncchat.mdc)
+```
+This demonstrates accessing distinct functionalities (`list`, `upload`, `create`) through their respective modules (`client.models`, `client.files`, `client.chats`).
+
+## Key Concepts
+
+*   **Logical Grouping:** Each module class encapsulates methods related to a specific domain of the API (e.g., `Models` handles model listing, generation, embedding; `Files` handles upload/download/metadata).
+*   **Facade Pattern:** They simplify interaction with a potentially complex subsystem (the underlying API) by providing a unified, higher-level interface. You interact with `client.models.generate_content` instead of directly constructing and sending the raw API request.
+*   **Access via Client Properties:** Modules are accessed as properties of an initialized `Client` object (e.g., `client.models`, `client.files`). The `Client` ensures these modules are instantiated with the correct configuration and shared underlying [`BaseApiClient`](baseapiclient.mdc).
+*   **Synchronous and Asynchronous:** For each synchronous module (e.g., `Models`), there's a corresponding asynchronous version (e.g., `AsyncModels`) accessible via `client.aio` (e.g., `client.aio.models`). They offer the same methods but are designed for non-blocking I/O using `async`/`await`.
+*   **Module Responsibilities (Examples):**
+    *   **`Models` / `AsyncModels`:** `generate_content`, `generate_content_stream`, `embed_content`, `count_tokens`, `list`, `get`, `update` (for tuned models), `generate_images`, `edit_image`, `upscale_image`, `generate_videos` (starts LRO).
+    *   **`Chats` / `AsyncChats` (Factory):** `create` method returns a `Chat` or `AsyncChat` instance for managing conversational state. See [Chat / AsyncChat](chat___asyncchat.mdc).
+    *   **`Files` / `AsyncFiles` (Gemini API only):** `upload`, `get`, `list`, `delete`, `download`.
+    *   **`Tunings` / `AsyncTunings`:** `tune` (starts tuning job), `get`, `list` (tuning jobs).
+    *   **`Caches` / `AsyncCaches`:** `create`, `get`, `list`, `update`, `delete` (for cached content).
+    *   **`Batches` / `AsyncBatches` (Vertex AI only):** `create`, `get`, `list`, `cancel`, `delete` (for batch prediction jobs).
+    *   **`Operations` / `AsyncOperations`:** `get` (for retrieving the status and result of Long-Running Operations like tuning or video generation).
+    *   **`Live` / `AsyncLive` (Preview):** `connect` method establishes a persistent WebSocket connection for real-time, low-latency interactions (e.g., streaming audio/video input). Accessed via `client.aio.live`.
+
+## Usage
+
+Using the modules is straightforward once the `Client` is configured. You access the desired module via its property name on the `client` or `client.aio` object and call its methods.
+
+```python
+# Assuming 'client' is configured for Gemini API
+from google import genai
+from google.genai import types
+
+# Using the Models module
+try:
+    response = client.models.generate_content(
+        model='gemini-1.5-flash',
+        contents='What is the capital of France?'
+    )
+    print(f"Model response: {response.text}")
+
+    # Using transformers implicitly
+    embedding = client.models.embed_content(
+        model='text-embedding-004', # Use an appropriate embedding model
+        contents='Embed this text.'
+    )
+    # The result is in embedding.embedding
+    print(f"Embedding vector length: {len(embedding.embedding)}")
+
+except Exception as e:
+    print(f"Models API call failed: {e}")
+
+# Using the Tunings module (conceptual example - requires setup)
+try:
+    # This would list tuning jobs you've previously started
+    print("\nListing tuning jobs:")
+    # config={'page_size': 5} is optional pagination config
+    tuning_pager = client.tunings.list(config={'page_size': 5})
+    for job in tuning_pager:
+        print(f"- Job: {job.name}, State: {job.state}")
+    if not tuning_pager.page:
+        print("  (No tuning jobs found)")
+except Exception as e:
+    print(f"Tunings API call failed: {e}")
+```
+
+## Internal Implementation
+
+Understanding how these modules work internally clarifies their relationship with the `Client` and the underlying API communication layer.
+
+1.  **Instantiation within `Client`:** When you create a `Client` instance (`genai.Client(...)`), its `__init__` method instantiates the synchronous API modules (`Models`, `Files`, `Tunings`, etc.). Critically, it passes the single, configured [`BaseApiClient`](baseapiclient.mdc) instance (`self._api_client`) to each module's constructor. The `AsyncClient` (`client.aio`) does the same for the asynchronous modules (`AsyncModels`, etc.), sharing the *same* `_api_client`. (See `google/genai/client.py`).
+
+2.  **Delegation to `BaseApiClient`:** The core logic for making HTTP requests, handling authentication, retries, and endpoint specifics resides in the [`BaseApiClient`](baseapiclient.mdc). API Module methods primarily prepare the request data (often using transformers) and then delegate the actual API call to methods on their stored `self._api_client` instance (e.g., `self._api_client.request(...)` or `self._api_client.async_request(...)`).
+
+3.  **Use of Transformers:** Many module methods accept user-friendly Python types (like strings, lists of strings/Parts, PIL Images) as input. Before calling the `BaseApiClient`, these methods often use internal [`t_` functions](transformers___t___functions_.mdc) (e.g., `t_contents`, `t_model`, `t_parts`) located in `google/genai/_transformers.py` to convert these inputs into the structured Pydantic models (`types.Content`, `types.Part`, etc.) or API-specific formats required by the backend. They might also use transformer functions to parse the API response back into SDK types.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant C as Client
+    participant Mod as Models Module (e.g., client.models)
+    participant T as Transformers (t_*)
+    participant BAC as BaseApiClient (client._api_client)
+    participant API as Backend API
+
+    User->>Mod: Call method (e.g., generate_content(contents='Hi'))
+    Mod->>T: Convert input (e.g., t_contents('Hi'))
+    T-->>Mod: Return structured data (e.g., list[Content])
+    Mod->>BAC: Call request(method, path, structured_data)
+    BAC->>API: Send HTTP Request
+    API-->>BAC: Receive HTTP Response
+    BAC-->>Mod: Return response data
+    Mod->>T: (Optional) Transform response data
+    T-->>Mod: Return SDK type (e.g., GenerateContentResponse)
+    Mod-->>User: Return result
+```
+
+*   **Base Class:** Most API modules inherit from `google.genai._api_module.BaseModule`, which simply stores the `_api_client` instance passed during initialization.
+
+    ```python
+    # google/genai/_api_module.py
+    from . import _api_client
+
+    class BaseModule:
+      def __init__(self, api_client_: _api_client.BaseApiClient):
+        self._api_client = api_client_
+
+      # ... provides access to api_client properties like .vertexai
+    ```
+
+*   **Example Module Method (Simplified `models.generate_content`):**
+    ```python
+    # Simplified structure from google/genai/models.py
+    from . import _api_module, _transformers as t, types, _common
+    from urllib.parse import urlencode
+
+    class Models(_api_module.BaseModule):
+        def generate_content(
+            self,
+            *,
+            model: str,
+            contents: types.ContentsType,
+            # ... other params like config, tools ...
+        ) -> types.GenerateContentResponse:
+
+            # 1. Prepare parameter model (using Pydantic for validation)
+            parameter_model = types._GenerateContentParameters(
+                model=model,
+                contents=contents,
+                # ... config=config, tools=tools ...
+            )
+
+            # 2. Use Transformers (t_) to convert input 'contents'
+            #    and build the API request dictionary.
+            #    (_GenerateContentParameters_to_mldev/vertex handles this)
+            if self._api_client.vertexai:
+                request_dict = _GenerateContentParameters_to_vertex(
+                    self._api_client, parameter_model
+                )
+                # ... determine path ...
+                path = f'{model_name}:generateContent' # Simplified
+            else:
+                request_dict = _GenerateContentParameters_to_mldev(
+                    self._api_client, parameter_model
+                )
+                # ... determine path ...
+                path = f'{model_name}:generateContent' # Simplified
+
+            # 3. Delegate API call to BaseApiClient
+            response_dict = self._api_client.request(
+                'post', path, request_dict, # ... http_options ...
+            )
+
+            # 4. Convert API response dict back to SDK type
+            if self._api_client.vertexai:
+                response_dict = _GenerateContentResponse_from_vertex(
+                    self._api_client, response_dict
+                )
+            else:
+                response_dict = _GenerateContentResponse_from_mldev(
+                    self._api_client, response_dict
+                )
+
+            # 5. Return SDK response object
+            return_value = types.GenerateContentResponse._from_response(...)
+            self._api_client._verify_response(return_value) # Check for errors
+            return return_value
+        # ... other methods like embed_content, list, get ...
+    ```
+    This shows the typical flow: preparing parameters, using transformers (often hidden within `_to_vertex`/`_to_mldev` helpers), calling the shared `_api_client`, processing the response (again, often using `_from_vertex`/`_from_mldev` helpers), and returning a structured SDK object.
+
+## Asynchronous Counterparts (`client.aio`)
+
+As mentioned, the `client.aio` property provides access to an `AsyncClient` instance, which in turn holds asynchronous versions of the API modules (`AsyncModels`, `AsyncFiles`, etc.). Their usage mirrors the synchronous modules but requires `async`/`await`.
+
+```python
+import asyncio
+
+# Assuming 'client' is configured for Gemini API
+async def list_models_async():
+    print("Available Async Models:")
+    # Access the async module via client.aio
+    async_pager = await client.aio.models.list(config={'page_size': 5})
+    # Iterate through the pager asynchronously
+    async for model in async_pager:
+         if "generateContent" in model.supported_generation_methods:
+            print(f"- {model.name}: {model.display_name}")
+
+# asyncio.run(list_models_async()) # Uncomment to run
+```
+
+## Conclusion
+
+The API Modules (`Models`, `Chats`, `Files`, `Tunings`, `Caches`, `Batches`, `Operations`, `Live`) are essential organizational components within the `google-genai` SDK. They act as Facades, grouping related API operations under intuitive properties of the main `Client` object (`client.models`, `client.files`, etc.). By leveraging the configured [`BaseApiClient`](baseapiclient.mdc) and often employing [`t_` functions](transformers___t___functions_.mdc) for data transformation, they provide a simplified and structured way to interact with the diverse capabilities of the Gemini and Vertex AI APIs, supporting both synchronous and asynchronous programming models.
+
+Now that we understand how functionalities are grouped, we can delve deeper into specific interaction patterns. The next chapter, [Chat / AsyncChat](chat___asyncchat.mdc), explores how the `Chats` module factory and the resulting `Chat`/`AsyncChat` objects manage multi-turn conversations.
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

@@ -1,0 +1,274 @@
+---
+description: Details google-adk's Session object for conversational history/state and BaseSessionService interface for session management.
+globs: 
+alwaysApply: false
+---
+# Chapter 3: Session (Session / BaseSessionService)
+
+In the [previous chapter](agent__baseagent___llmagent_.mdc), we explored the `Agent` abstraction, the core entity that processes user requests. However, conversations are rarely single-turn interactions. How does an agent remember what was said before? How does it maintain information specific to this conversation across multiple turns? This is where the `Session` and `BaseSessionService` come into play.
+
+## Motivation and Use Case
+
+Imagine a chatbot helping users book flights.
+*   **User:** "I want to fly from London to New York."
+*   **Agent:** "Okay, London to New York. When would you like to travel?"
+*   **User:** "Sometime next week."
+*   **Agent:** "Got it. Any preferred airline?"
+
+For the agent to ask relevant follow-up questions, it needs to remember:
+1.  The sequence of messages exchanged (the conversation history).
+2.  Key pieces of information extracted or inferred during the conversation (the origin, destination, and rough travel dates).
+
+The `Session` object provides the mechanism to store this information. It encapsulates the conversation history and associated state, making interactions stateful. The `BaseSessionService` defines how these sessions are created, retrieved, updated, and stored.
+
+**Central Use Case:** A user starts a chat with a travel agent bot. The application, using a [Runner](runner.mdc), creates a new `Session` via a `BaseSessionService` implementation (e.g., `InMemorySessionService` for testing or `DatabaseSessionService` for persistence). As the user interacts ("Book a flight"), the `Runner` retrieves the session, appends the user's message as an [Event](event.mdc), invokes the agent, receives the agent's response [Events](event.mdc), and appends those events to the session via the service. If the agent extracts information (like destination="New York"), it updates the session's [State](state.mdc) via an `EventAction`, which is persisted by the `BaseSessionService` when the event is appended. In the next turn, the agent can access this history and state to continue the booking process contextually.
+
+## Key Concepts
+
+*   **`Session` Object (`session.py`):**
+    *   **Purpose:** A data container representing a single, continuous conversation thread.
+    *   **`events` (list[[Event](event.mdc)]):** Stores the chronological sequence of interactions (user messages, agent responses, tool calls, tool results) as `Event` objects. This provides the conversational history.
+    *   **`state` (dict[str, Any]):** A dictionary holding data that needs to persist across multiple turns *within this specific session*. This allows agents and tools to maintain context (e.g., user preferences identified earlier, intermediate results). See [State](state.mdc) for details on different state scopes.
+    *   **Identifiers:** Contains `id` (unique session identifier), `app_name` (identifies the application using the session), and `user_id` (identifies the user associated with the session).
+    *   **`last_update_time` (float):** Timestamp of the last modification, used for potential concurrency control in persistent storage.
+
+*   **`BaseSessionService` (`base_session_service.py`):**
+    *   **Purpose:** An abstract base class (ABC) defining the *interface* for managing `Session` objects. It decouples the agent/runner logic from the specific storage mechanism.
+    *   **Core Methods:** Defines essential operations:
+        *   `create_session`: Creates a new session for a given app/user.
+        *   `get_session`: Retrieves an existing session by its identifiers, optionally loading only recent events.
+        *   `list_sessions`: Lists sessions for a specific app/user (typically without loading full event history).
+        *   `delete_session`: Removes a session.
+        *   `append_event`: Adds a non-partial [Event](event.mdc) to a session's history *and* updates the session's persistent [State](state.mdc) based on the event's `actions.state_delta`. This is the primary method used by the [Runner](runner.mdc) to save turn results.
+        *   `list_events`: Retrieves events for a session (less commonly used directly by the Runner).
+    *   **State Management:** The `append_event` method in `BaseSessionService` includes default logic to process `event.actions.state_delta` and update the *in-memory* session object's `state` dictionary. Concrete implementations must ensure this state is also persisted to their respective backends.
+
+*   **Concrete Implementations:**
+    *   `InMemorySessionService` (`in_memory_session_service.py`): Stores all sessions, events, and state directly in Python dictionaries in memory. Ideal for testing, development, or short-lived applications. Does not persist data across application restarts. Supports app/user/session state scopes.
+    *   `DatabaseSessionService` (`database_session_service.py`): Uses SQLAlchemy to persist sessions, events, and state (app/user/session scopes) to a relational database (e.g., PostgreSQL, SQLite). Requires database setup.
+    *   `VertexAiSessionService` (`vertex_ai_session_service.py`): Connects to a managed Google Cloud Vertex AI service for session storage. Suitable for cloud-based deployments.
+
+*   **`Runner` Integration:** The [Runner](runner.mdc) relies heavily on a `BaseSessionService` instance provided during initialization.
+    1.  **Before Agent Turn:** Calls `get_session` to load the current session context (history and state).
+    2.  **During Agent Turn:** Passes the loaded `Session` object within the [InvocationContext](invocationcontext.mdc) for the agent/tools to read history and state.
+    3.  **After Agent Turn:** For each non-partial [Event](event.mdc) yielded by the agent, the `Runner` calls `append_event` on the service to persist the event and any associated state changes (`event.actions.state_delta`) to the backend.
+
+## How to Use Session and SessionService
+
+You typically interact with the `Session` indirectly via the `InvocationContext` provided to your agent or tool. The `Runner` manages the interaction with the `BaseSessionService`.
+
+1.  **Initializing Runner with a Session Service:**
+    When creating a [Runner](runner.mdc), you must provide a `BaseSessionService` instance. `InMemoryRunner` provides a default `InMemorySessionService`.
+
+    ```python
+    from google.adk.runners import Runner, InMemoryRunner
+    from google.adk.sessions import InMemorySessionService, DatabaseSessionService #, VertexAiSessionService
+    # from my_agent import my_root_agent # Your agent instance
+
+    # Option 1: For quick testing
+    # runner = InMemoryRunner(agent=my_root_agent, app_name="test_app")
+
+    # Option 2: Explicitly using InMemorySessionService
+    session_service_mem = InMemorySessionService()
+    runner_mem = Runner(
+        app_name="test_app_mem",
+        agent=my_root_agent,
+        session_service=session_service_mem
+    )
+
+    # Option 3: Using DatabaseSessionService (requires DB setup)
+    # db_url = "sqlite:///./my_adk_sessions.db" # Example SQLite URL
+    # session_service_db = DatabaseSessionService(db_url=db_url)
+    # runner_db = Runner(
+    #     app_name="test_app_db",
+    #     agent=my_root_agent,
+    #     session_service=session_service_db
+    # )
+    ```
+    *Technical Explanation:* The `Runner` needs a concrete `BaseSessionService` implementation (`InMemorySessionService`, `DatabaseSessionService`, etc.) to handle session persistence. `InMemoryRunner` simplifies setup by creating an `InMemorySessionService` automatically.
+
+2.  **Creating/Getting Sessions (Application Layer):**
+    Your application logic (e.g., a web server handling user requests) would typically create a session if one doesn't exist for a user, or retrieve the existing one using the service instance from the runner.
+
+    ```python
+    # Assuming 'runner' is an initialized Runner instance
+    session_service = runner.session_service
+    app_name = runner.app_name
+    user_id = "user_abc"
+    session_id = "chat_123" # Can be provided or generated by the service
+
+    try:
+        # Attempt to get an existing session
+        session = session_service.get_session(
+            app_name=app_name, user_id=user_id, session_id=session_id
+        )
+        if not session:
+            print(f"Session {session_id} not found, creating a new one.")
+            # Or create one if it doesn't exist (some services might require explicit creation)
+            session = session_service.create_session(
+                app_name=app_name, user_id=user_id, session_id=session_id,
+                state={"initial_topic": "greeting"} # Optional initial state
+            )
+            print(f"Created session: {session.id}")
+
+    except Exception as e:
+        print(f"Error getting/creating session: {e}")
+        # Handle error appropriately
+    ```
+    *Technical Explanation:* Use the `session_service` instance associated with your `Runner` to call `get_session` or `create_session`. The `app_name` and `user_id` are crucial for scoping. `session_id` uniquely identifies the conversation.
+
+3.  **Accessing Session Data in Agent/Tool:**
+    Inside your agent's `run_async` or a tool's execution logic, you access the current session via the [InvocationContext](invocationcontext.mdc).
+
+    ```python
+    from google.adk.agents import InvocationContext, LlmAgent
+    from google.adk.events import Event
+    from google.genai import types
+
+    async def my_agent_logic(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        # Access current session state
+        current_topic = ctx.session.state.get("current_topic", "unknown")
+        print(f"Current topic from state: {current_topic}")
+
+        # Access conversation history (e.g., last user message)
+        last_user_event = next(
+            (e for e in reversed(ctx.session.events) if e.author == 'user'), None
+        )
+        if last_user_event:
+            print(f"Last user message: {last_user_event.content.parts[0].text}")
+
+        # Agent generates a response...
+        response_text = f"Acknowledged message about {current_topic}."
+        yield Event(
+            author=self.name,
+            invocation_id=ctx.invocation_id,
+            content=types.Content(parts=[types.Part(text=response_text)]),
+            # ... potentially update state in actions ...
+        )
+    ```
+    *Technical Explanation:* The `InvocationContext` (`ctx`) passed to agent/tool methods contains a reference to the current `Session` object (`ctx.session`). You can read `ctx.session.state` and `ctx.session.events` directly.
+
+4.  **Updating Session State:**
+    State is typically updated by including a `state_delta` dictionary in the `actions` field of an [Event](event.mdc) yielded by the agent or tool. The `BaseSessionService.append_event` method (called by the `Runner`) handles merging this delta into the session's state.
+
+    ```python
+    from google.adk.events import Event, EventActions
+    from google.adk.sessions import State # Import State for prefixes
+
+    # Inside agent/tool logic...
+    new_topic = "flight_booking"
+    user_preference = "aisle_seat"
+
+    yield Event(
+        author=self.name, # Or tool name
+        invocation_id=ctx.invocation_id,
+        content=types.Content(parts=[types.Part(text="Okay, let's book a flight.")]),
+        actions=EventActions(
+            state_delta={
+                "current_topic": new_topic, # Session-scoped state
+                State.USER_PREFIX + "seat_preference": user_preference # User-scoped state
+            }
+        )
+    )
+    ```
+    *Technical Explanation:* Create an `EventActions` object with a `state_delta` dictionary. Keys define the state variable names, and values are the new values. The `Runner` passes this event to `session_service.append_event`, which updates the persistent state according to the implementation (in-memory dict, database row, etc.). Use prefixes like `State.USER_PREFIX` or `State.APP_PREFIX` for broader state scopes if supported by the service.
+
+## Internal Implementation
+
+*   **`Session` Model (`session.py`):**
+    The `Session` is a Pydantic `BaseModel`, providing data validation and structure.
+
+    ```python
+    # Simplified from src/google/adk/sessions/session.py
+    from pydantic import BaseModel, Field
+    from typing import Any, List
+    from google.adk.events import Event
+
+    class Session(BaseModel):
+        id: str
+        app_name: str
+        user_id: str
+        state: dict[str, Any] = Field(default_factory=dict)
+        events: List[Event] = Field(default_factory=list)
+        last_update_time: float = 0.0
+        # model_config details omitted
+    ```
+    *Technical Explanation:* A straightforward data class holding the session's core attributes.
+
+*   **`BaseSessionService.append_event` (`base_session_service.py`):**
+    The base class provides the logic for updating the *in-memory* session state dictionary based on the event's actions. Concrete implementations *must* override this or ensure their persistence mechanism reflects these changes.
+
+    ```python
+    # Simplified from src/google/adk/sessions/base_session_service.py
+    import abc
+    from google.adk.events import Event
+    from .session import Session
+    from .state import State
+
+    class BaseSessionService(abc.ABC):
+        # ... other abstract methods (create, get, list, delete) ...
+
+        def append_event(self, session: Session, event: Event) -> Event:
+            """Appends an event to a session object."""
+            if event.partial: # Do not persist partial events
+                return event
+            # Update in-memory state based on event actions
+            self.__update_session_state(session, event)
+            # Append event to in-memory list
+            session.events.append(event)
+            # Concrete implementations must handle persisting the event and state changes.
+            return event
+
+        def __update_session_state(self, session: Session, event: Event):
+            """Updates the session state based on the event."""
+            if not event.actions or not event.actions.state_delta:
+                return
+            for key, value in event.actions.state_delta.items():
+                # Skip temporary state variables (not persisted)
+                if key.startswith(State.TEMP_PREFIX):
+                    continue
+                # Update the state dict of the passed-in session object
+                session.state.update({key: value})
+    ```
+    *Technical Explanation:* The base `append_event` handles adding the event to the `session.events` list and calls `__update_session_state` to modify the `session.state` dictionary based on `event.actions.state_delta`. It explicitly ignores partial events and temporary state variables.
+
+*   **`DatabaseSessionService` (`database_session_service.py`):**
+    Uses SQLAlchemy ORM to map `Session`, `Event`, and different state scopes (`AppState`, `UserState`) to database tables (`StorageSession`, `StorageEvent`, etc.). `append_event` overrides the base method to commit changes to the database within a transaction. It uses helper functions (`_extract_state_delta`, `_merge_state`) to manage the different state scopes.
+
+*   **Runner-Service Interaction Sequence:**
+
+    ```mermaid
+    sequenceDiagram
+        participant UserApp
+        participant Runner
+        participant SessionService as BaseSessionService
+        participant Agent as BaseAgent / LlmAgent
+
+        UserApp->>+Runner: run_async(user_id, session_id, new_message)
+        Runner->>+SessionService: get_session(app_name, user_id, session_id)
+        SessionService-->>-Runner: session (with history & state)
+        Runner->>Runner: Create InvocationContext(session, ...)
+        Runner->>+SessionService: append_event(session, user_event) # Persist user message
+        SessionService-->>-Runner:
+        Runner->>+Agent: run_async(invocation_context)
+        loop Agent yields non-partial events
+            Agent-->>-Runner: event (with potential state_delta)
+            Runner->>+SessionService: append_event(session, event) # Persist agent event & state changes
+            SessionService-->>-Runner:
+            Runner-->>-UserApp: yield event
+        end
+        Agent-->>-Runner: (iteration complete)
+        Runner-->>-UserApp: (async generator finishes)
+    ```
+    *Technical Explanation:* The diagram shows the `Runner` first retrieving the `Session` using the `SessionService`. It then appends the incoming user message. After the `Agent` runs and yields events, the `Runner` calls `append_event` again for each non-partial event to persist the agent's turn results and any state updates.
+
+## Conclusion
+
+The `Session` object and the `BaseSessionService` interface are crucial for building conversational agents that maintain context. The `Session` acts as the memory unit, holding the history (`events`) and current context (`state`) of a conversation. The `BaseSessionService` provides a standardized way to manage these sessions, allowing flexibility in choosing storage backends (in-memory, database, cloud service) without changing the core agent logic. The [Runner](runner.mdc) seamlessly integrates with the session service to load context before each turn and save updates afterward.
+
+Understanding sessions lays the groundwork for managing context. Next, we'll take a closer look at the different scopes and uses of the dictionary stored within the session: the [State](state.mdc).
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

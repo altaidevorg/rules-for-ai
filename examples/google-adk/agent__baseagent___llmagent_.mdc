@@ -1,0 +1,286 @@
+---
+description: Tutorial chapter for google-adk's Agent (BaseAgent / LlmAgent), detailing the core agent abstraction, its structure, hierarchy, and the LLM-powered implementation.
+globs: 
+alwaysApply: true
+---
+# Chapter 2: Agent (BaseAgent / LlmAgent)
+
+In the [previous chapter](runner.mdc), we learned about the `Runner`, the orchestrator that manages agent execution within a session. Now, we dive into the core component being orchestrated: the `Agent` itself. This chapter focuses on `BaseAgent`, the fundamental agent abstraction, and `LlmAgent`, its primary LLM-powered implementation.
+
+## Motivation and Use Case
+
+To build sophisticated AI applications, we need a way to represent autonomous entities that can perceive, reason, plan, and act to achieve goals. These entities might need to use external tools (like search engines or APIs), execute code, follow complex instructions, and potentially collaborate with other similar entities.
+
+The `Agent` abstraction in `google-adk` provides this structure. `BaseAgent` defines the common interface and properties for any agent, while `LlmAgent` provides a powerful implementation leveraging Large Language Models (LLMs) for reasoning and task execution.
+
+**Central Use Case:** Imagine building a "Research Assistant" agent. This agent needs to:
+1. Understand a user's research query (e.g., "Summarize recent advancements in quantum computing").
+2. Use a web search tool to find relevant articles.
+3. Process the search results.
+4. Generate a concise summary.
+Furthermore, perhaps the summarization task is complex enough to warrant a dedicated "Summarizer" sub-agent. The `Agent` abstraction allows us to define the Research Assistant (`LlmAgent`), equip it with a search [Tool (BaseTool)](tool__basetool_.mdc), define its instructions, and structure it to potentially delegate to a Summarizer sub-agent.
+
+## Key Concepts
+
+*   **`BaseAgent` (Interface & Structure):**
+    *   **Interface:** Defines the core execution methods: `run_async` (for typical turn-based interaction) and `run_live` (experimental, for real-time streaming).
+    *   **Structure:** Holds fundamental properties like `name` (unique identifier), `description` (capability summary used for delegation), `parent_agent` (reference to the containing agent), and `sub_agents` (list of contained agents).
+    *   **Hierarchy:** Enables building multi-agent systems by nesting agents within each other via `sub_agents`. The `parent_agent` field is automatically set when an agent is added to another's `sub_agents`.
+    *   **Callbacks:** Provides hooks (`before_agent_callback`, `after_agent_callback`) to inject custom logic before and after the agent's core execution logic.
+
+*   **`LlmAgent` (LLM-Powered Implementation):**
+    *   **Inheritance:** Extends `BaseAgent`, inheriting its structure and interface.
+    *   **LLM Integration:** Requires a [BaseLlm](basellm.mdc) (specified via the `model` attribute, which can be a string name or a `BaseLlm` instance) to drive its behavior. It automatically finds the model from ancestors if not set directly.
+    *   **Instructions:** Takes `instruction` (specific guidance) and `global_instruction` (applied across the entire agent tree, set on the root agent) to configure the LLM's behavior. These can be strings or functions returning strings based on the [InvocationContext](invocationcontext.mdc).
+    *   **Tools:** Can be equipped with a list of [Tools (BaseTool)](tool__basetool_.mdc) (functions, `BaseTool` instances) that the LLM can choose to invoke.
+    *   **Generation Config:** Allows fine-tuning LLM generation via `generate_content_config` (e.g., temperature, safety settings).
+    *   **Planning:** Supports structured planning via a `planner` (instance of `BasePlanner`), enabling multi-step reasoning and execution.
+    *   **Code Execution:** Can execute code snippets using a `code_executor` (instance of `BaseCodeExecutor`) or by adding the `built_in_code_execution` tool for model-native execution.
+    *   **Transfer Control:** Provides flags (`disallow_transfer_to_parent`, `disallow_transfer_to_peers`) to control whether the LLM can decide to delegate tasks back up or sideways in the agent hierarchy.
+    *   **Specific Callbacks:** Offers additional callbacks tied to the LLM lifecycle: `before_model_callback`, `after_model_callback`, `before_tool_callback`, `after_tool_callback`.
+    *   **Structured I/O:** Can define `input_schema` and `output_schema` (Pydantic models) for typed interactions, especially when used as a tool or in sequential workflows. An `output_key` can specify where to save the agent's final output in the [State](state.mdc).
+
+## How to Use `Agent`
+
+You'll primarily interact with `LlmAgent` to build LLM-driven agents.
+
+1.  **Define a Simple `LlmAgent`:**
+
+    ```python
+    from google.adk.agents import LlmAgent # Alias for Agent
+    from google.adk.tools import google_search # Example tool
+
+    # Define a simple agent that uses Google Search
+    search_agent = LlmAgent(
+        name="search_assistant",
+        # Can be a model name string (e.g., "gemini-1.5-flash-001")
+        # or a BaseLlm instance
+        model="gemini-1.5-flash-001",
+        instruction="You are a helpful assistant. Use Google Search to answer user questions.",
+        description="An assistant that searches the web.",
+        tools=[google_search] # Provide tools the LLM can use
+    )
+
+    # This agent can now be passed to a Runner
+    # runner = InMemoryRunner(agent=search_agent, app_name="search_app")
+    # # ... run the runner ...
+    ```
+    *Technical Explanation:* We create an `LlmAgent` instance, giving it a unique `name`, specifying the `model` to use, providing an `instruction` to guide the LLM, a `description` for potential delegation, and a list of `tools` it can invoke.
+
+2.  **Define Hierarchical Agents:**
+
+    ```python
+    from google.adk.agents import LlmAgent
+
+    # Define specialized sub-agents
+    greeter_agent = LlmAgent(
+        name="greeter", model="gemini-1.5-flash-001",
+        instruction="Politely greet the user.",
+        description="Handles greetings."
+    )
+    research_agent = LlmAgent( # Assume this agent has search tools, etc.
+        name="researcher", model="gemini-1.5-pro-001",
+        instruction="Perform web research based on user queries.",
+        description="Performs web research.",
+        # tools=[google_search, ...] # Tools defined here
+    )
+
+    # Define a parent agent coordinating the sub-agents
+    coordinator_agent = LlmAgent(
+        name="coordinator",
+        model="gemini-1.5-flash-001",
+        instruction="Greet the user, then use the researcher if needed.",
+        description="Coordinates user interactions and research tasks.",
+        sub_agents=[greeter_agent, research_agent] # Add sub-agents here
+    )
+
+    # coordinator_agent now contains greeter_agent and research_agent
+    # research_agent.parent_agent will be coordinator_agent
+    # runner = InMemoryRunner(agent=coordinator_agent, app_name="coordinator_app")
+    ```
+    *Technical Explanation:* We define two specialized agents (`greeter_agent`, `research_agent`) and a `coordinator_agent`. The `coordinator_agent` lists the specialized agents in its `sub_agents` parameter. The framework automatically sets the `parent_agent` attribute on `greeter_agent` and `research_agent` to point to `coordinator_agent`.
+
+3.  **Using Callbacks (Example: `before_model_callback`)**
+
+    ```python
+    from google.adk.agents import LlmAgent
+    from google.adk.agents.callback_context import CallbackContext
+    from google.adk.models.llm_request import LlmRequest
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    def modify_request_or_skip_llm(
+        callback_context: CallbackContext, llm_request: LlmRequest
+    ) -> Optional[LlmResponse]:
+        """Callback to potentially modify request or skip LLM call."""
+        user_query = callback_context.invocation_context.user_content.parts[0].text
+        if "secret password" in user_query.lower():
+            print("Intercepted sensitive query, skipping LLM.")
+            # Return a canned response, skipping the actual LLM call
+            return LlmResponse(
+                content=types.Content(parts=[types.Part(text="I cannot process requests containing sensitive information.")])
+            )
+        # Modify the request (e.g., add context from state)
+        if 'user_prefs' in callback_context.state:
+            llm_request.history.append(types.Content(role="user", parts=[
+                types.Part(text=f"INTERNAL_NOTE: User preferences are {callback_context.state['user_prefs']}")
+            ]))
+        return None # Allow LLM call to proceed
+
+    callback_agent = LlmAgent(
+        name="callback_example",
+        model="gemini-1.5-flash-001",
+        instruction="Respond normally.",
+        before_model_callback=modify_request_or_skip_llm
+    )
+    ```
+    *Technical Explanation:* The `modify_request_or_skip_llm` function implements the `BeforeModelCallback` signature. It receives the `CallbackContext` (providing access to [State](state.mdc), [InvocationContext](invocationcontext.mdc), etc.) and the `LlmRequest`. It can modify `llm_request` in place (like adding history based on state) or return an `LlmResponse` to short-circuit the LLM call entirely. The function is passed to the `LlmAgent`'s `before_model_callback` parameter.
+
+## Internal Implementation
+
+Understanding the agent's lifecycle helps in debugging and building complex interactions.
+
+**`BaseAgent` Execution Flow (`run_async`)**
+
+When an agent's `run_async` is called (typically by the [Runner](runner.mdc) or a parent agent):
+
+1.  **Span Start:** A tracing span is started for the agent run (e.g., `agent_run [agent_name]`).
+2.  **Context Creation:** A new [InvocationContext](invocationcontext.mdc) specific to this agent is created (`_create_invocation_context`), inheriting relevant information from the parent context but updating the `agent` field to `self`.
+3.  **Before Callback:** The `before_agent_callback` (if defined) is executed (`__handle_before_agent_callback`).
+    *   It receives a `CallbackContext`.
+    *   If the callback returns a `types.Content`, an [Event](event.mdc) is created with this content, the invocation is marked to end (`ctx.end_invocation = True`), and the event is yielded. Execution stops here for this agent.
+    *   If the callback modifies state, an event reflecting state changes is created but execution continues.
+4.  **Core Logic:** If the invocation wasn't ended by the callback, the agent-specific core logic `_run_async_impl` is called with the agent's `InvocationContext`. This is where `LlmAgent` handles LLM interaction, tool calls, etc. Events yielded by `_run_async_impl` are passed up.
+5.  **After Callback:** If the invocation wasn't ended *during* `_run_async_impl`, the `after_agent_callback` (if defined) is executed (`__handle_after_agent_callback`).
+    *   It receives a `CallbackContext`.
+    *   If it returns `types.Content` or modifies state, a final [Event](event.mdc) is created and yielded.
+
+```mermaid
+sequenceDiagram
+    participant RunnerOrParent as Runner / Parent Agent
+    participant Agent as BaseAgent (self)
+    participant Callback as before/after_agent_callback
+    participant CoreLogic as _run_async_impl
+
+    RunnerOrParent->>+Agent: run_async(parent_context)
+    Agent->>Agent: _create_invocation_context(parent_context)
+    opt before_agent_callback exists
+        Agent->>+Callback: before_agent_callback(callback_context)
+        Callback-->>-Agent: Optional[Content] / State Changes
+        alt Callback returns Content
+            Agent->>Agent: Create Event, ctx.end_invocation = True
+            Agent-->>-RunnerOrParent: yield Event
+            Note right of Agent: Execution Stops
+        else Callback modifies State
+            Agent->>Agent: Create State Event (may yield later)
+        end
+    end
+    opt NOT ctx.end_invocation
+        Agent->>+CoreLogic: _run_async_impl(ctx)
+        loop Yields events
+            CoreLogic-->>-Agent: yield event
+            Agent-->>-RunnerOrParent: yield event
+        end
+        CoreLogic-->>-Agent: (implementation finishes)
+        opt after_agent_callback exists
+            Agent->>+Callback: after_agent_callback(callback_context)
+            Callback-->>-Agent: Optional[Content] / State Changes
+            opt Callback returns Content or modifies State
+                Agent->>Agent: Create Event
+                Agent-->>-RunnerOrParent: yield Event
+            end
+        end
+    end
+    Agent-->>-RunnerOrParent: (async generator finishes)
+```
+
+**`LlmAgent` Core Logic (`_run_async_impl`)**
+
+The `LlmAgent`'s `_run_async_impl` delegates the complex task of managing LLM interactions to an internal `BaseLlmFlow` object.
+
+1.  **Flow Selection:** It determines which flow to use (e.g., `SingleFlow` for simple replies, `AutoFlow` for handling tools, planning, and agent transfer). `AutoFlow` is typically used unless transfers and sub-agents are explicitly disallowed.
+2.  **Delegation:** It calls `self._llm_flow.run_async(ctx)`.
+3.  **Flow Execution:** The selected [BaseLlmFlow](basellmflow.mdc) implementation then handles the cycle:
+    *   Building the [LlmRequest](basellm.mdc) (history, instructions, tools, planner state, etc.).
+    *   Invoking `before_model_callback`.
+    *   Calling the [BaseLlm](basellm.mdc)'s `generate_content_async`.
+    *   Invoking `after_model_callback`.
+    *   Parsing the [LlmResponse](basellm.mdc) (checking for tool calls, code execution requests, plan updates, final answer).
+    *   Invoking `before_tool_callback`, calling the [Tool (BaseTool)](tool__basetool_.mdc) if needed, and invoking `after_tool_callback`.
+    *   Executing code via the `code_executor` if requested.
+    *   Updating the plan via the `planner` if used.
+    *   Generating and yielding [Events](event.mdc) for each step (thoughts, tool calls/results, code output, final answer chunks).
+    *   Looping back to build the next request if the turn isn't finished (e.g., after a tool call).
+4.  **Output Saving:** After receiving an event from the flow, `LlmAgent` checks if `output_key` is set and if the event is a final response. If so, it saves the response content (potentially validated against `output_schema`) into the session [State](state.mdc) via `event.actions.state_delta`.
+
+**Code Snippets**
+
+*   `base_agent.py`: `run_async` orchestrates the callback and core logic calls.
+    ```python
+    # From src/google/adk/agents/base_agent.py
+    @final
+    async def run_async(
+        self,
+        parent_context: InvocationContext,
+    ) -> AsyncGenerator[Event, None]:
+        with tracer.start_as_current_span(f'agent_run [{self.name}]'):
+            ctx = self._create_invocation_context(parent_context)
+
+            if event := self.__handle_before_agent_callback(ctx):
+                yield event
+            if ctx.end_invocation: # Stop if callback returned content
+                return
+
+            # Delegate to agent-specific implementation (e.g., LlmAgent's)
+            async for event in self._run_async_impl(ctx):
+                yield event
+
+            if ctx.end_invocation: # Stop if core logic ended invocation
+                return
+
+            if event := self.__handle_after_agent_callback(ctx):
+                yield event
+    ```
+    *Technical Explanation:* Shows the final `run_async` method coordinating calls to context creation, callbacks, and the implementation-specific `_run_async_impl`.
+
+*   `llm_agent.py`: `_run_async_impl` delegates to the flow, `canonical_model` resolves the model.
+    ```python
+    # From src/google/adk/agents/llm_agent.py
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        # Delegate the core LLM interaction logic to a Flow object
+        async for event in self._llm_flow.run_async(ctx):
+            self.__maybe_save_output_to_state(event) # Save output if configured
+            yield event
+
+    @property
+    def canonical_model(self) -> BaseLlm:
+        # Resolves self.model (str or BaseLlm) into a BaseLlm instance
+        if isinstance(self.model, BaseLlm): return self.model
+        elif self.model: return LLMRegistry.new_llm(self.model)
+        else: # Find model from ancestors if not set locally
+            # ... logic to traverse parent_agent ...
+            raise ValueError(f'No model found for {self.name}.')
+
+    @property
+    def _llm_flow(self) -> BaseLlmFlow:
+        # Selects AutoFlow if sub-agents or transfers are possible
+        if ( ... conditions for SingleFlow ... ):
+            return SingleFlow()
+        else:
+            return AutoFlow() # Handles tools, planning, transfer etc.
+    ```
+    *Technical Explanation:* `_run_async_impl` shows the delegation to the `_llm_flow`. `canonical_model` demonstrates how the agent resolves the potentially inherited `model` string into a concrete `BaseLlm` object using the `LLMRegistry`. `_llm_flow` shows the basic logic for selecting the appropriate flow strategy.
+
+## Conclusion
+
+The `Agent` (`BaseAgent` and `LlmAgent`) is the heart of `google-adk`, providing the structure and capabilities for building autonomous entities. `BaseAgent` establishes the core interface and hierarchical structure, while `LlmAgent` offers a powerful, LLM-driven implementation with support for instructions, tools, planning, code execution, and fine-grained control through callbacks and configuration.
+
+With the `Runner` orchestrating the interaction and the `Agent` defining the actors, we now need a way to manage the state of the conversation over time. The next chapter explores the [Session (Session / BaseSessionService)](session__session___basesessionservice_.mdc), which is responsible for persisting conversation history and state between agent turns.
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

@@ -1,0 +1,387 @@
+---
+description: Explains Flax NNX nnx.Variable (mutable state container in Modules) and nnx.VariableState (immutable JAX-compatible state).
+globs: 
+alwaysApply: false
+---
+# Chapter 2: nnx.Variable / nnx.VariableState
+
+In the [previous chapter](nnx_module.mdc), we introduced `nnx.Module` as the foundation for building stateful neural network components in Flax NNX. We saw that modules hold their state (like parameters) as attributes. This chapter delves into the core mechanism NNX uses to represent and manage this state: `nnx.Variable` and its immutable counterpart, `nnx.VariableState`.
+
+## Motivation: Bridging Stateful Objects and Functional JAX
+
+JAX thrives on pure functions operating on immutable data structures (pytrees). However, defining complex models often feels more natural using stateful object-oriented programming. How can we reconcile these two paradigms?
+
+NNX uses `nnx.Variable` to encapsulate state *within* the familiar, mutable `nnx.Module` object. When it's time to interact with JAX transformations (`jit`, `grad`, etc.), NNX extracts this state into an immutable pytree structure where the leaves are `nnx.VariableState` objects. This separation allows developers to work with intuitive stateful objects while ensuring compatibility with JAX's functional nature.
+
+*   **`nnx.Variable`**: Lives inside the `nnx.Module` instance. It's a mutable container holding the actual state value (e.g., a JAX array) and associated metadata. You interact with it directly when defining or updating the module's state.
+*   **`nnx.VariableState`**: Exists *outside* the module instance, typically as part of the `State` pytree returned by `nnx.split` or `nnx.state`. It's an immutable snapshot of a `Variable`'s value and metadata, suitable for use in JAX-transformed functions.
+
+## Central Use Case: Defining and Managing Different State Types
+
+Let's enhance our `nnx.Module` with different kinds of state using various `nnx.Variable` subclasses.
+
+```python
+import jax
+import jax.numpy as jnp
+from flax import nnx
+from flax.nnx.nn import initializers
+
+# Define needed RNGs
+rngs = nnx.Rngs(0)
+
+class StatefulComponent(nnx.Module):
+  def __init__(self, features: int, *, rngs: nnx.Rngs):
+    # Learnable parameters
+    self.weight = nnx.Param(
+        initializers.lecun_normal()(rngs.params(), (features, features))
+    )
+    self.bias = nnx.Param(initializers.zeros_init()(rngs.params(), (features,)))
+    
+    # Batch statistics (e.g., for BatchNorm)
+    self.running_mean = nnx.BatchStat(jnp.zeros((features,)))
+    
+    # RNG state (e.g., for Dropout)
+    self.dropout_rng = nnx.RngState(rngs.dropout()) 
+    
+    # Custom state variable
+    class StepCount(nnx.Variable): pass 
+    self.steps = StepCount(0)
+
+  def __call__(self, x: jax.Array):
+    # Access variable values using .value
+    output = jnp.dot(x, self.weight.value) + self.bias.value
+    
+    # Simulate using batch stats (simplified)
+    # In reality, this would involve updating running_mean based on batch data
+    output = output - self.running_mean.value 
+    
+    # Simulate using RNG state
+    key = self.dropout_rng.value # Get current key
+    key, subkey = jax.random.split(key)
+    # In nnx.Dropout, the RngState variable is updated automatically
+    # Here we simulate a manual update (not typical):
+    # self.dropout_rng.value = key 
+    noise = jax.random.normal(subkey, output.shape)
+    output = output + noise
+    
+    # Update custom state
+    self.steps.value += 1
+    
+    return output
+
+  def update_mean(self, new_mean: jax.Array):
+    # Directly mutate the Variable's value
+    self.running_mean.value = new_mean
+
+# Instantiate
+component = StatefulComponent(features=4, rngs=rngs)
+
+# Create dummy input
+x = jnp.ones((1, 4))
+
+# Call the component (modifies internal state)
+y = component(x)
+print(f"Initial step count: {component.steps.value}")
+y = component(x)
+print(f"Step count after second call: {component.steps.value}")
+
+# Update a variable directly
+component.update_mean(jnp.ones(4) * 0.1)
+print(f"Updated running mean: {component.running_mean.value}")
+
+# --- Interaction with Functional API ---
+
+# Split the component into structure (GraphDef) and state (State)
+graphdef, state = nnx.split(component)
+
+print("\nExtracted State (containing VariableState objects):")
+# Note: Output structure matches module attributes. Leaves are VariableState.
+print(state) 
+
+# The 'state' object is an immutable pytree suitable for JAX functions
+# We can inspect the type and value of a specific state leaf
+print(f"\nWeight state type: {type(state['weight'])}")
+print(f"Weight value shape: {state['weight'].value.shape}")
+
+# Reconstruct the component using nnx.merge
+reconstructed_component = nnx.merge(graphdef, state)
+print(f"\nReconstructed step count: {reconstructed_component.steps.value}")
+assert component.steps.value == reconstructed_component.steps.value
+```
+
+**Example Output (structure/types shown, values may vary):**
+
+```
+Initial step count: 1
+Step count after second call: 2
+Updated running mean: [0.1 0.1 0.1 0.1]
+
+Extracted State (containing VariableState objects):
+State({
+  'bias': VariableState(type=Param, ...),
+  'dropout_rng': VariableState(type=RngState, ...),
+  'running_mean': VariableState(type=BatchStat, ...),
+  'steps': VariableState(type=StepCount, ...),
+  'weight': VariableState(type=Param, ...)
+})
+
+Weight state type: <class 'flax.nnx.variablelib.VariableState'>
+Weight value shape: (4, 4)
+
+Reconstructed step count: 2 
+```
+
+This example demonstrates:
+1.  Defining various state types (`Param`, `BatchStat`, `RngState`, custom `StepCount`) as attributes using `nnx.Variable` subclasses in `__init__`.
+2.  Accessing the underlying value using the `.value` property within methods.
+3.  Mutating the state directly by assigning to the `.value` property of the `nnx.Variable` attribute (e.g., `self.steps.value += 1`, `self.running_mean.value = ...`).
+4.  How `nnx.split` extracts the state, converting each `nnx.Variable` into an immutable `nnx.VariableState` within the `State` pytree.
+5.  How `nnx.merge` reconstructs the `nnx.Module` instance from the `GraphDef` and `State`, restoring the `nnx.Variable` attributes.
+
+## Key Concepts
+
+### `nnx.Variable`: The Mutable State Container
+
+`nnx.Variable` is the core building block for holding state *inside* an `nnx.Module`.
+
+*   **Container:** It wraps a raw value (usually a JAX array, but can be any Python object) and associated metadata.
+*   **Mutability:** `Variable` instances themselves are mutable containers. You change the state they hold by assigning a new value to their `.value` property: `my_variable.value = new_jax_array`. This mutation happens directly on the `nnx.Module` instance attribute.
+*   **Metadata:** Can store arbitrary Python objects as metadata (e.g., information about distributed axes, optimizer hyperparameters). Access metadata like attributes: `my_variable.some_metadata`.
+*   **Subclasses for Categorization:** Different subclasses of `Variable` are used to categorize state. Common built-in types include:
+    *   `nnx.Param`: Learnable parameters (weights, biases). The default target for gradients and optimizer updates.
+    *   `nnx.BatchStat`: Running statistics used in layers like `nnx.BatchNorm`.
+    *   `nnx.RngState`: Holds JAX PRNGKeys, used for stochastic layers like `nnx.Dropout`. Managed by `nnx.Rngs`.
+    *   `nnx.Cache`: Used for autoregressive decoding caches in attention layers.
+    *   `nnx.Intermediate`: Often used with `Module.sow` to collect intermediate activations.
+    *   `nnx.Perturbation`: Used with `Module.perturb` for debugging intermediate gradients.
+    *   **Custom:** You can define your own subclasses (like `StepCount` above) for specific state needs.
+*   **Filtering:** The primary purpose of these subclasses is to enable selective operations on the state using [Filters (`filterlib`)](filters___filterlib__.mdc). For example, you can easily extract *only* the `nnx.Param` variables for the optimizer or *only* the `nnx.BatchStat` variables to update them during inference.
+
+```python
+# Define a custom Variable type
+class MyCustomState(nnx.Variable): pass
+
+# Inside an nnx.Module's __init__
+self.my_state = MyCustomState({'learning_rate': 0.01, 'iterations': 0})
+
+# Accessing value and metadata
+current_lr = self.my_state.value['learning_rate'] 
+print(f"Current LR: {current_lr}")
+
+# Mutating the value (replace the whole dict in this case)
+new_state_dict = self.my_state.value.copy()
+new_state_dict['iterations'] += 10
+self.my_state.value = new_state_dict 
+print(f"Updated iterations: {self.my_state.value['iterations']}") 
+```
+
+### `nnx.VariableState`: The Immutable JAX Counterpart
+
+`nnx.VariableState` represents the state *outside* the `nnx.Module`, typically within the `State` pytree generated by `nnx.split` or `nnx.state`.
+
+*   **Immutable Snapshot:** It holds the raw value and metadata captured from an `nnx.Variable` at the time of extraction (`nnx.split`).
+*   **JAX Compatibility:** `VariableState` is designed to be a leaf node in a JAX pytree. JAX functions (`jax.jit`, `jax.grad`, `jax.vmap`, etc.) operate on these pytrees of `VariableState` objects. Because they are immutable (or treated as such by JAX), they fit naturally into JAX's functional programming model.
+*   **Structure:** Contains attributes:
+    *   `type`: The original `nnx.Variable` subclass (e.g., `nnx.Param`).
+    *   `value`: The raw state value (e.g., the JAX array).
+    *   Metadata: A dictionary (`_var_metadata`) holding the associated metadata.
+*   **PyTree Registration:** `VariableState` is registered as a JAX PyTree. Its `value` is treated as a child node (dynamic), while its `type` and metadata are treated as static auxiliary data. This means JAX transformations will trace operations on the `value` but treat the type and metadata as constant.
+
+```python
+# Assume 'component' and 'state' from the previous example
+
+# Accessing info from VariableState
+param_state = state['weight']
+print(f"Type: {param_state.type}")          # -> <class 'flax.nnx.Param'>
+print(f"Value shape: {param_state.value.shape}") # -> (4, 4)
+print(f"Metadata: {param_state.get_metadata()}") # -> {} (empty in this case)
+
+# VariableState is treated as immutable by JAX
+# Direct mutation like this is not intended and won't work within JAX transforms:
+# param_state.value = jnp.zeros_like(param_state.value) # Don't do this
+
+# Convert VariableState back to Variable (e.g., manually after a JAX transform)
+param_variable = param_state.to_variable() 
+print(f"Converted back to type: {type(param_variable)}") # -> <class 'flax.nnx.Param'>
+```
+
+### Metadata
+
+Both `Variable` and `VariableState` carry metadata. This is a dictionary associated with the state value. It's static data from JAX's perspective.
+
+*   **Purpose:** Store auxiliary information related to the variable, such as:
+    *   Axis names for distributed training (sharding).
+    *   Optimizer-specific info (e.g., weight decay masks).
+    *   Initialization details.
+*   **Access:** Access metadata via attribute access on the `Variable` or `VariableState` object (e.g., `variable.axis_name`).
+*   **Initialization:** Metadata can be passed during `Variable` initialization or using the `nnx.with_metadata` wrapper around initializer functions.
+
+```python
+from flax.experimental import nnx # Or flax.nnx if using stable version
+
+class ModuleWithMetadata(nnx.Module):
+  def __init__(self, features, *, rngs):
+    # Define Param with custom metadata 'info'
+    self.kernel = nnx.Param(
+        jax.random.normal(rngs.params(), (features, features)),
+        info='This is a kernel matrix' 
+    )
+
+module_md = ModuleWithMetadata(2, rngs=rngs)
+print(f"Kernel info: {module_md.kernel.info}") # -> Kernel info: This is a kernel matrix
+
+graphdef, state_md = nnx.split(module_md)
+print(f"Kernel state info: {state_md['kernel'].info}") # -> Kernel state info: This is a kernel matrix
+```
+
+## Interaction with Functional API (`split`/`merge`)
+
+The interplay between `Variable` and `VariableState` is managed by the [NNX Functional API (split/merge/state/update/graphdef)](nnx_functional_api__split_merge_state_update_graphdef_.mdc):
+
+1.  **`nnx.split(module)` / `nnx.state(module)`:**
+    *   Traverses the `module` graph.
+    *   For each attribute that is an `nnx.Variable` instance (`var`), it calls `var.to_state()`.
+    *   This creates a `VariableState` object containing the `var.type`, `var.raw_value`, and `var._var_metadata`.
+    *   These `VariableState` objects become the leaves of the resulting `State` pytree.
+
+2.  **`nnx.merge(graphdef, state)`:**
+    *   Reconstructs the module structure based on `graphdef`.
+    *   Traverses the `state` pytree.
+    *   When it encounters a `VariableState` object (`var_state`) corresponding to an attribute in the `graphdef`:
+        *   It calls `var_state.to_variable()`.
+        *   This creates a new `nnx.Variable` instance of type `var_state.type`, initialized with `var_state.value` and `var_state._var_metadata`.
+    *   This newly created `Variable` becomes the attribute on the reconstructed module instance.
+
+This seamless conversion allows stateful `nnx.Module` methods to be transformed by JAX using the [NNX Lifted Transforms (jit, grad, vmap, scan, etc.)](nnx_lifted_transforms__jit__grad__vmap__scan__etc__.mdc), which automate the `split`/`merge` process.
+
+## Internal Implementation Insights
+
+*   **`nnx.Variable` (`flax/nnx/variablelib.py`):**
+    *   Is a standard Python class, holding `raw_value` and `_var_metadata` (a dict).
+    *   Uses `__slots__` for efficiency.
+    *   `value` property getter/setter: Apply hooks (`on_get_value`, `on_set_value`) if they exist in metadata. Setters also check `_trace_state` to prevent mutation from incorrect JAX trace levels.
+    *   `__init__`: Stores value/metadata, runs `on_create_value` hooks.
+    *   `to_state()`: Simple instantiation of `VariableState`.
+    *   `copy_from()`, `update_from_state()`: Methods for efficient state transfer.
+    *   Defines many proxy methods (`__add__`, `__getitem__`, etc.) that forward operations to `self.value`.
+
+*   **`nnx.VariableState` (`flax/nnx/variablelib.py`):**
+    *   Also uses `__slots__`. Behaves like a dataclass.
+    *   Holds `type`, `value`, `_var_metadata`.
+    *   `to_variable()`: Instantiates the `Variable` subclass stored in `self.type`.
+    *   **PyTree Registration:**
+        *   `_variable_state_flatten`: Returns the `value` as the dynamic child and `(type, metadata)` as static auxiliary data.
+        *   `_variable_state_unflatten`: Reconstructs the `VariableState` from the static data and the (potentially transformed) value leaf.
+
+**`split`/`merge` Data Flow:**
+
+```mermaid
+sequenceDiagram
+    participant User as User Code
+    participant Module as nnx.Module Instance
+    participant Var as nnx.Variable Attribute
+    participant NFunc as NNX Functional API (split/merge)
+    participant VState as nnx.VariableState
+    participant State as State Pytree
+
+    User->>NFunc: nnx.split(module)
+    activate NFunc
+    NFunc->>Module: Iterate attributes
+    NFunc->>Var: Call var.to_state()
+    activate Var
+    Var->>VState: Create VariableState(type, value, metadata)
+    activate VState
+    VState-->>Var: Return VariableState instance
+    deactivate VState
+    Var-->>NFunc: Return VariableState instance
+    deactivate Var
+    NFunc->>State: Add VariableState as leaf
+    NFunc-->>User: Return (graphdef, state)
+    deactivate NFunc
+
+    User->>NFunc: nnx.merge(graphdef, state)
+    activate NFunc
+    NFunc->>State: Iterate leaves
+    NFunc->>VState: Call var_state.to_variable()
+    activate VState
+    VState->>Var: Create Variable(value, metadata) of type var_state.type
+    activate Var
+    Var-->>VState: Return Variable instance
+    deactivate Var
+    VState-->>NFunc: Return Variable instance
+    deactivate VState
+    NFunc->>Module: Set attribute = new Variable instance
+    NFunc-->>User: Return reconstructed Module
+    deactivate NFunc
+```
+
+## Variable Subclasses and Filtering
+
+As mentioned, the different `Variable` subclasses (`Param`, `BatchStat`, etc.) are crucial for selectively accessing and manipulating parts of the model's state.
+
+```python
+from flax import nnx
+
+class MyModel(nnx.Module):
+  def __init__(self, *, rngs: nnx.Rngs):
+    self.dense = nnx.Linear(10, 10, rngs=rngs)
+    self.bn = nnx.BatchNorm(10, use_running_average=False, rngs=rngs)
+    self.counter = nnx.Variable(0) # Basic Variable
+
+model = MyModel(rngs=nnx.Rngs(1))
+
+# Get only parameters using nnx.state and a filter
+params_state = nnx.state(model, nnx.Param) 
+print("Parameters:")
+print(params_state)
+
+# Get only batch stats
+bn_state = nnx.state(model, nnx.BatchStat)
+print("\nBatch Stats:")
+print(bn_state)
+
+# Split into multiple states based on filters
+graphdef, params, batch_stats, rest = nnx.split(
+    model, nnx.Param, nnx.BatchStat, ... # Ellipsis (...) matches remaining variables
+)
+print("\nRemaining Variables (counter):")
+print(rest)
+```
+
+**Output (structure shown):**
+```
+Parameters:
+State({
+  'bn': {
+    'bias': VariableState(type=Param, ...), 
+    'scale': VariableState(type=Param, ...)
+    }, 
+  'dense': {
+    'bias': VariableState(type=Param, ...), 
+    'kernel': VariableState(type=Param, ...)
+    }
+  })
+
+Batch Stats:
+State({
+  'bn': {
+    'mean': VariableState(type=BatchStat, ...), 
+    'var': VariableState(type=BatchStat, ...)
+    }
+  })
+
+Remaining Variables (counter):
+State({'counter': VariableState(type=Variable, value=0)})
+```
+This ability to filter based on `Variable` type is fundamental for tasks like applying optimizers only to `Param`s or updating `BatchStat`s differently during training vs. evaluation. Filters are covered in detail in the [Filters (`filterlib`)](filters___filterlib__.mdc) chapter.
+
+## Conclusion
+
+`nnx.Variable` and `nnx.VariableState` form the backbone of state management in Flax NNX. `nnx.Variable` provides a mutable container integrated within the stateful `nnx.Module`, allowing for intuitive object-oriented model definition and state updates. `nnx.VariableState` serves as its immutable, JAX-compatible counterpart, enabling seamless integration with JAX's functional transformations via the `nnx.split` and `nnx.merge` operations. The use of `Variable` subclasses is key to categorizing state and enabling powerful filtering capabilities.
+
+Understanding this mutable/immutable state duality is crucial for effectively using NNX. In the next chapter, we'll look specifically at how randomness is managed using [nnx.Rngs](nnx_rngs.mdc), which relies on the `nnx.RngState` variable type.
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

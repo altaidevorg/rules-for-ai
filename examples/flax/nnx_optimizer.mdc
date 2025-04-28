@@ -1,0 +1,321 @@
+---
+description: Explains Flax NNX nnx.Optimizer for managing Module, Optax state, and optimizer updates in training loops.
+globs: flax/nnx/training/optimizer.py
+alwaysApply: false
+---
+# Chapter 8: nnx.Optimizer
+
+In the [previous chapter](graph_representation__graphdef___graphstate_.mdc), we examined the internal `GraphDef` and `GraphState` representations used by the [NNX Functional API (split/merge/state/update/graphdef)](nnx_functional_api__split_merge_state_update_graphdef_.mdc). Now, we'll look at a practical helper class built upon these concepts that significantly simplifies the standard training loop structure in NNX: `nnx.Optimizer`.
+
+## Motivation: Simplifying Stateful Training Loops
+
+A typical JAX training loop involves managing several pieces of state: the model's parameters, the optimizer's internal state (e.g., momentum vectors), and potentially a step counter. While you can manage these separately using the functional API or standard Python variables, it often leads to boilerplate code for passing state around and applying updates.
+
+Flax Linen introduced `flax.training.TrainState` to bundle these components. `nnx.Optimizer` serves a similar purpose in the NNX ecosystem. It's a stateful container, inheriting from `nnx.Object`, designed to hold an `nnx.Module` instance, the corresponding Optax optimizer state (`opt_state`), and the Optax gradient transformation (`tx`). This colocation simplifies the training process by providing a single object that manages both the model's learnable parameters and the optimizer's evolving state. Its primary `update()` method streamlines the application of gradients.
+
+## Central Use Case: A Standard Training Step
+
+Let's illustrate how `nnx.Optimizer` simplifies a basic training step involving gradient computation and parameter updates.
+
+```python
+import jax
+import jax.numpy as jnp
+from flax import nnx
+import optax # Standard JAX optimizer library
+
+class SimpleModel(nnx.Module):
+  def __init__(self, din: int, dout: int, *, rngs: nnx.Rngs):
+    self.linear = nnx.Linear(din, dout, rngs=rngs)
+
+  def __call__(self, x: jax.Array) -> jax.Array:
+    return self.linear(x)
+
+# --- Setup ---
+key = jax.random.key(0)
+model_key, data_key = jax.random.split(key)
+model = SimpleModel(din=10, dout=5, rngs=nnx.Rngs(model_key))
+
+# Define Optax optimizer
+tx = optax.adam(learning_rate=1e-3)
+
+# 1. Instantiate nnx.Optimizer
+#    It holds the model, the optimizer transformation (tx), 
+#    and initializes the optimizer state internally.
+optimizer = nnx.Optimizer(model, tx) 
+
+x_batch = jax.random.normal(data_key, (32, 10))
+y_batch = jnp.ones((32, 5)) # Dummy targets
+
+# --- Loss Function ---
+# Takes the *model* part of the optimizer as input
+def loss_fn(model: SimpleModel, x: jax.Array, y: jax.Array):
+  y_pred = model(x)
+  loss = jnp.mean((y_pred - y) ** 2)
+  return loss
+
+# --- JITted Training Step ---
+@nnx.jit # Use nnx.jit with nnx.Optimizer
+def train_step(optimizer: nnx.Optimizer, x: jax.Array, y: jax.Array):
+  # 2. Calculate gradients w.r.t. model's Params (default)
+  #    Pass optimizer.model to the loss function
+  grad_fn = nnx.value_and_grad(loss_fn)
+  loss, grads = grad_fn(optimizer.model, x, y) 
+  
+  # 3. Apply gradients using optimizer.update()
+  #    This updates optimizer.model parameters and optimizer.opt_state in-place.
+  optimizer.update(grads)
+  
+  # optimizer object with updated state is returned by nnx.jit
+  return loss, optimizer 
+
+# --- Execute ---
+print(f"Initial loss: {loss_fn(optimizer.model, x_batch, y_batch)}")
+
+# Run one training step
+# Note: nnx.jit returns a *new* optimizer instance with updated state
+loss, updated_optimizer = train_step(optimizer, x_batch, y_batch) 
+
+print(f"Loss after step: {loss}")
+# Access the updated model via the returned optimizer
+print(f"Loss after update (recomputed): {loss_fn(updated_optimizer.model, x_batch, y_batch)}") 
+```
+
+**Example Output:**
+```
+Initial loss: 1.45921...
+Loss after step: 1.45921...
+Loss after update (recomputed): 1.44487... 
+```
+
+This example highlights:
+1.  Creating an `nnx.Optimizer` bundles the `model` and `tx`.
+2.  `nnx.grad` (or `value_and_grad`) is applied to a function that takes the model (`optimizer.model`) as the differentiable argument.
+3.  `optimizer.update(grads)` performs the update step, modifying the parameters within `optimizer.model` and the internal `opt_state` in-place (when used within a lifted transform like `nnx.jit`, the transform manages returning the updated stateful object).
+
+## Key Concepts
+
+### 1. Encapsulation of Training State
+
+`nnx.Optimizer` acts as a container:
+
+*   `model`: An attribute holding the `nnx.Module` instance whose parameters are being trained.
+*   `tx`: Holds the Optax gradient transformation function (e.g., `optax.adam(...)`).
+*   `opt_state`: Holds the Optax optimizer state. This state is managed internally using special `nnx.Variable` subtypes (`OptState`, `OptArray`, `OptVariable`).
+*   `step`: An `OptState` variable tracking the number of training steps (incremented during `update`).
+*   `wrt` ([Filter (`filterlib`)](filters___filterlib__.mdc)): A filter (defaulting to `nnx.Param`) specifying which variable types within the `model` should be considered learnable parameters. This filter is used both during initialization to create the correct `opt_state` shape and during `update` to extract the relevant parameters for Optax.
+
+```python
+# Accessing components
+print(f"Optimizer Step: {optimizer.step.value}")
+print(f"Model type: {type(optimizer.model)}")
+print(f"Optimizer Tx: {optimizer.tx}") 
+# optimizer.opt_state contains wrapped Optax state
+```
+
+### 2. Optimizer State Management (`OptState`, `OptVariable`, `OptArray`)
+
+Optax optimizers often maintain internal state (like momentum buffers) which can be complex pytrees. Some leaves might correspond directly to model parameters (`nnx.Param`), requiring them to be treated like `nnx.Variable`s for proper state tracking within NNX.
+
+`nnx.Optimizer` handles this by wrapping the raw Optax state during initialization (`__init__`) using the `_wrap_optimizer_state` internal function:
+*   If a leaf in the Optax state pytree corresponds to an `nnx.VariableState` (meaning it tracks a parameter defined by the `wrt` filter), it's converted into an `OptVariable` instance. `OptVariable` is a subclass of `OptState` (which is an `nnx.Variable`), storing the original variable type (`source_type`) in its metadata.
+*   Other leaves (standard JAX arrays) are wrapped in `OptArray` instances (also a subclass of `OptState`).
+
+This wrapping makes the entire optimizer state a valid NNX graph component, trackable via `nnx.split`/`nnx.merge`.
+
+During the `update` method, before calling `tx.update`, the internal `_opt_state_variables_to_state` function unwraps this state:
+*   `OptVariable` instances are converted back to standard `nnx.VariableState` objects (restoring `source_type` as `type`).
+*   `OptArray` instances are unwrapped back to their raw JAX array values.
+
+After `tx.update` computes the `new_opt_state` (raw Optax state), the internal `_update_opt_state` function updates the wrapped state held within the `Optimizer` instance in-place.
+
+This wrapping/unwrapping ensures seamless integration of Optax state within the NNX state management system.
+
+### 3. `update(grads)` Method
+
+This is the core method for applying updates.
+
+*   **Signature:** `update(self, grads, **kwargs)`
+*   **`grads`:** A pytree of gradients, typically the output of `nnx.grad(..., wrt=self.wrt)`. The structure and variable types within `grads` *must* match the `wrt` filter used when initializing the `nnx.Optimizer`.
+*   **`**kwargs`:** Optional extra arguments passed directly to `self.tx.update()`, supporting advanced Optax features like stateful transformations that require additional inputs (e.g., loss value for line search).
+*   **Steps:**
+    1.  Extract current parameters from `self.model` matching `self.wrt` using `nnx.state(self.model, self.wrt)`.
+    2.  Unwrap the internal `self.opt_state` into a raw Optax state pytree using `_opt_state_variables_to_state`.
+    3.  Call `self.tx.update(grads, opt_state, params, **kwargs)` to get parameter updates and the new raw Optax state.
+    4.  Apply parameter updates using `optax.apply_updates(params, updates)`.
+    5.  Update `self.model` in-place with the new parameters using `nnx.update(self.model, new_params)`.
+    6.  Update the internal wrapped `self.opt_state` in-place using the new raw Optax state and `_update_opt_state`.
+    7.  Increment `self.step.value`.
+
+### 4. Statefulness and Integration
+
+Since `nnx.Optimizer` inherits from `nnx.Object`, it is a stateful NNX graph node itself.
+*   You can `nnx.split(optimizer)` to get its `GraphDef` and `State` (which includes the model's state, the step count, and the wrapped opt_state).
+*   It works seamlessly with [NNX Lifted Transforms (jit, grad, vmap, scan, etc.)](nnx_lifted_transforms__jit__grad__vmap__scan__etc__.mdc). When passed to a function decorated with `nnx.jit`, for example, the entire state of the optimizer (including model params and opt_state) is managed automatically.
+
+### 5. Customization (`wrt` filter)
+
+The `wrt` filter allows you to specify exactly which `nnx.Variable` types in your model should be considered parameters for optimization. This is powerful for scenarios like freezing certain layers or optimizing custom variable types.
+
+```python
+from flax import nnx
+import jax.numpy as jnp
+import optax
+
+class CustomVar(nnx.Variable): pass # Define a custom variable type
+
+class ModelWithCustom(nnx.Module):
+  def __init__(self, *, rngs: nnx.Rngs):
+    self.linear = nnx.Linear(2, 2, rngs=rngs)
+    self.custom = CustomVar(jnp.array([1.0, 2.0]))
+
+  def __call__(self, x):
+    return self.linear(x) + self.custom.value
+
+model_c = ModelWithCustom(rngs=nnx.Rngs(0))
+tx = optax.adam(1e-2)
+x = jnp.ones((1, 2))
+y = jnp.zeros((1, 2))
+
+# --- Optimize ONLY nnx.Param (default) ---
+opt_param = nnx.Optimizer(model_c, tx) # wrt=nnx.Param by default
+loss_fn = lambda m: jnp.sum((m(x) - y)**2)
+grads_param = nnx.grad(loss_fn)(opt_param.model) 
+# grads_param contains grads only for linear.kernel and linear.bias
+print("Grads for Params:\n", grads_param) 
+opt_param.update(grads_param)
+print(f"Custom var after Param update: {opt_param.model.custom.value}") # Unchanged
+
+# --- Optimize ONLY CustomVar ---
+opt_custom = nnx.Optimizer(model_c, tx, wrt=CustomVar)
+# Make sure nnx.grad uses the same wrt filter!
+grads_custom = nnx.grad(loss_fn, wrt=CustomVar)(opt_custom.model)
+# grads_custom contains grads only for custom variable
+print("\nGrads for CustomVar:\n", grads_custom)
+linear_kernel_before = opt_custom.model.linear.kernel.value.copy()
+opt_custom.update(grads_custom)
+print(f"Linear kernel after CustomVar update (unchanged): {jnp.allclose(linear_kernel_before, opt_custom.model.linear.kernel.value)}") # True
+print(f"Custom var after CustomVar update: {opt_custom.model.custom.value}") # Changed
+
+# --- Optimize BOTH nnx.Param and CustomVar ---
+opt_both = nnx.Optimizer(model_c, tx, wrt=(nnx.Param, CustomVar)) 
+grads_both = nnx.grad(loss_fn, wrt=(nnx.Param, CustomVar))(opt_both.model)
+opt_both.update(grads_both)
+print(f"\nCustom var after Both update: {opt_both.model.custom.value}") # Changed again
+```
+Remember that the `wrt` filter passed to `nnx.Optimizer` **must** match the filter used in the corresponding `nnx.grad` call.
+
+## Internal Implementation
+
+**Initialization (`__init__`) Walkthrough:**
+1.  Store the input `model`, `tx`, and `wrt` filter.
+2.  Initialize `step = OptState(0)`.
+3.  Extract the initial parameter state from `model` using `nnx.state(model, wrt)`.
+4.  Call `tx.init(params_state)` to get the initial raw Optax optimizer state (`raw_opt_state`).
+5.  Wrap the `raw_opt_state` using `_wrap_optimizer_state` to convert `VariableState` leaves to `OptVariable` and other leaves to `OptArray`. Store this wrapped state as `self.opt_state`.
+
+**Update (`update`) Walkthrough:**
+1.  Get current parameters: `params = nnx.state(self.model, self.wrt)`.
+2.  Unwrap optimizer state: `opt_state = _opt_state_variables_to_state(self.opt_state)`.
+3.  Compute updates and new state: `updates, new_opt_state = self.tx.update(grads, opt_state, params, **kwargs)`.
+4.  Apply updates to params: `new_params = optax.apply_updates(params, updates)`.
+5.  Update model in-place: `nnx.update(self.model, new_params)`.
+6.  Update internal optimizer state in-place: `_update_opt_state(self.opt_state, new_opt_state)`.
+7.  Increment step: `self.step.value += 1`.
+
+**Sequence Diagram (`optimizer.update(grads)`):**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Optimizer as nnx.Optimizer Instance
+    participant StateAPI as nnx.state/update
+    participant Optax as Optax (tx.update, apply_updates)
+    participant OptStateHelpers as _opt_state_* helpers
+    participant Model as optimizer.model
+
+    User->>Optimizer: update(grads)
+    activate Optimizer
+    Optimizer->>StateAPI: state(Model, self.wrt)
+    activate StateAPI
+    StateAPI-->>Optimizer: current_params (State)
+    deactivate StateAPI
+    Optimizer->>OptStateHelpers: _opt_state_variables_to_state(self.opt_state)
+    activate OptStateHelpers
+    OptStateHelpers-->>Optimizer: raw_opt_state
+    deactivate OptStateHelpers
+    Optimizer->>Optax: tx.update(grads, raw_opt_state, current_params)
+    activate Optax
+    Optax-->>Optimizer: param_updates, new_raw_opt_state
+    deactivate Optax
+    Optimizer->>Optax: apply_updates(current_params, param_updates)
+    activate Optax
+    Optax-->>Optimizer: new_params (State)
+    deactivate Optax
+    Optimizer->>StateAPI: update(Model, new_params)
+    activate StateAPI
+    StateAPI->>Model: Update Variable.value in-place
+    deactivate StateAPI
+    Optimizer->>OptStateHelpers: _update_opt_state(self.opt_state, new_raw_opt_state)
+    activate OptStateHelpers
+    OptStateHelpers->>Optimizer: Update self.opt_state Variables in-place
+    deactivate OptStateHelpers
+    Optimizer->>Optimizer: self.step.value += 1
+    deactivate Optimizer
+    User-->>Optimizer: Returns (None)
+```
+
+**Code References (`flax/nnx/training/optimizer.py`):**
+*   `Optimizer`: The main class definition, inheriting `nnx.Object`.
+*   `Optimizer.__init__`: Handles initialization, including the call to `_wrap_optimizer_state(tx.init(...))`.
+*   `Optimizer.update`: Implements the update logic described above.
+*   `OptState`, `OptArray`, `OptVariable`: Custom `nnx.Variable` subclasses used for wrapping Optax state.
+*   `_wrap_optimizer_state`: Maps raw Optax state leaves to `OptArray` or `OptVariable`.
+*   `_opt_state_variables_to_state`: Converts the wrapped state back to raw Optax state + `VariableState`.
+*   `_update_opt_state`: Updates the internal wrapped `opt_state` from new raw Optax state.
+
+```python
+# Simplified view of _wrap_optimizer_state logic
+def _wrap_optimizer_state(opt_state):
+  def wrap_fn(x):
+    if isinstance(x, nnx.VariableState):
+      # Wrap state corresponding to model params
+      var = OptVariable(x.value) # Create NNX Variable
+      var.source_type = x.type # Store original type
+      # Add other metadata if needed...
+      return var 
+    else:
+      # Wrap regular arrays (e.g., momentum)
+      return OptArray(x) # Create NNX Variable
+
+  return jax.tree.map(
+    wrap_fn, opt_state, 
+    is_leaf=lambda x: isinstance(x, nnx.VariableState)
+  )
+
+# Simplified view of _opt_state_variables_to_state logic
+def _opt_state_variables_to_state(wrapped_opt_state):
+  def unwrap_fn(x):
+    if isinstance(x, OptVariable):
+      # Convert back to VariableState for Optax
+      state = x.to_state()
+      state.type = x.source_type # Restore original type
+      # Remove helper metadata if added...
+      return state
+    elif isinstance(x, OptArray):
+      # Unwrap regular JAX array
+      return x.value
+    # ... error handling ...
+  
+  return jax.tree.map(unwrap_fn, wrapped_opt_state)
+```
+
+## Conclusion
+
+`nnx.Optimizer` provides a convenient and standardized way to manage the essential components of a training loop in Flax NNX: the model, the Optax transformation, and the optimizer state. By encapsulating these elements and providing a simple `update()` method, it reduces boilerplate and integrates smoothly with NNX's state management system and lifted transforms like `nnx.jit`. Its `wrt` filter offers flexibility in defining which parts of the model are optimized. This class, while simple, significantly improves the developer experience for common training scenarios.
+
+This chapter concludes the core concepts of the Flax NNX library. You now have a foundational understanding of Modules, Variables, RNGs, Filters, Lifted Transforms, the Functional API, Graph Representations, and the Optimizer utility.
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

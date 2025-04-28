@@ -1,0 +1,244 @@
+---
+description: Explains Flax NNX GraphDef (static structure) and GraphState (dynamic values), the internal representation used by the functional API.
+globs: 
+alwaysApply: false
+---
+# Chapter 7: Graph Representation (GraphDef / GraphState)
+
+In the [previous chapter](nnx_functional_api__split_merge_state_update_graphdef_.mdc), we explored the NNX Functional API (`nnx.split`, `nnx.merge`, etc.) which provides the bridge between stateful `nnx.Module` objects and JAX's functional world. This chapter delves into the core data structures returned and consumed by this API: `GraphDef` and `GraphState`. These structures represent the internal state of an `nnx.Module` graph in a way that is compatible with JAX transformations.
+
+## Motivation: Separating Structure from State for JAX
+
+JAX requires pure functions and immutable pytrees for its transformations (`jax.jit`, `jax.grad`, etc.). However, `nnx.Module`s are inherently stateful Python objects. To make these work with JAX, NNX needs a way to represent them functionally. The solution is to split the `nnx.Module` into two distinct parts:
+
+1.  **Static Structure:** Everything about the module's composition that doesn't change during typical execution – the types of layers, their attribute names, the nesting hierarchy, and importantly, how different parts might share underlying objects (like shared weights). This needs to be static from JAX's perspective, ideally hashable, so it can be part of the compilation cache key.
+2.  **Dynamic State:** The actual values held within the module, primarily the JAX arrays constituting parameters, batch statistics, optimizer states, etc. This is the part that changes during training or inference and needs to be processed by JAX transformations. It must be represented as a JAX pytree.
+
+`GraphDef` captures the static structure, and `GraphState` holds the dynamic state. The functional API functions (`nnx.split`, `nnx.merge`) are responsible for converting between the stateful `nnx.Module` object and this `(GraphDef, GraphState)` pair.
+
+## Central Use Case: Inspecting `split` Output
+
+The most direct way to interact with `GraphDef` and `GraphState` is by calling `nnx.split`. Let's see what it produces:
+
+```python
+import jax
+import jax.numpy as jnp
+from flax import nnx
+
+class SharedLinear(nnx.Module):
+  def __init__(self, linear: nnx.Linear):
+    self.shared_layer = linear
+
+class MyModel(nnx.Module):
+  def __init__(self, din, dout, *, rngs: nnx.Rngs):
+    shared = nnx.Linear(din, dout, rngs=rngs)
+    self.block1 = SharedLinear(shared)
+    self.block2 = SharedLinear(shared) # Share the same Linear layer
+    self.other_param = nnx.Param(jnp.array(1.0))
+
+model = MyModel(din=2, dout=3, rngs=nnx.Rngs(0))
+
+# Split the model
+graphdef, state = nnx.split(model)
+
+print("--- GraphDef ---")
+print(f"Type: {type(graphdef)}")
+# graphdef is complex, print simplified structure for illustration
+# print(graphdef) # Output would be very detailed
+
+print("\n--- State ---")
+print(f"Type: {type(state)}")
+# State is a pytree, inspect its structure and leaf types
+state_structure = jax.tree.map(
+    lambda x: f"VariableState(type={x.type.__name__}, value={x.value.shape})" 
+              if isinstance(x, nnx.VariableState) else type(x).__name__, 
+    state,
+    is_leaf=lambda x: isinstance(x, nnx.VariableState)
+)
+print(state_structure)
+```
+
+**Example Output:**
+
+```
+--- GraphDef ---
+Type: <class 'flax.nnx.graph.GraphDef'>
+
+--- State ---
+Type: <class 'flax.nnx.statelib.State'>
+State({
+  'block1': State({
+    'shared_layer': State({
+      'bias': VariableState(type=Param, value=(3,)), 
+      'kernel': VariableState(type=Param, value=(2, 3))
+    })
+  }), 
+  'block2': State({
+    'shared_layer': State({}) # Note: Empty state here due to sharing
+  }), 
+  'other_param': VariableState(type=Param, value=())
+})
+```
+
+In this example:
+1.  `nnx.split(model)` returns two objects: `graphdef` and `state`.
+2.  `graphdef` is an instance of `nnx.GraphDef`. It internally contains a detailed, static description of `MyModel`, including the types `MyModel`, `SharedLinear`, `Linear`, the attribute names (`block1`, `block2`, `shared_layer`, `other_param`, `kernel`, `bias`), and crucially, information that `block1.shared_layer` and `block2.shared_layer` point to the *same* underlying `Linear` instance. It's designed to be hashable and static for JAX.
+3.  `state` is an `nnx.State` object (which behaves like a nested dictionary and is a JAX pytree). Its structure mirrors the `model`. The leaves are `nnx.VariableState` objects holding the actual parameter values (JAX arrays) and their types (`nnx.Param`). Notice how the state for `block2.shared_layer` is empty; this is because `GraphDef` handles the sharing, and the actual parameter values are only stored once (under `block1.shared_layer` in this flattened representation).
+
+## Key Concepts
+
+### 1. `nnx.GraphDef`: The Static Blueprint
+
+`GraphDef` defines the "shape" or blueprint of your `nnx.Module` graph.
+
+*   **Purpose:** To capture the static structural information necessary to reconstruct the module graph, independent of the actual data values.
+*   **Content:**
+    *   **Node Definitions:** Types of each node (e.g., `MyModel`, `nnx.Linear`, `dict`, `list`).
+    *   **Attribute Information:** Names and order of attributes within each node.
+    *   **Variable Definitions:** For attributes that are `nnx.Variable`s, stores their type (e.g., `nnx.Param`, `nnx.BatchStat`) and any static metadata.
+    *   **Shared References (`NodeRef`):** Explicitly encodes when multiple paths point to the same underlying `nnx.Module` or `nnx.Variable` instance. This is critical for preserving weight sharing or other forms of sharing during `split`/`merge`.
+    *   **Static Values:** Non-Variable, non-Module attributes (like hyperparameters stored as plain floats or strings) are embedded directly.
+*   **Properties:**
+    *   **Immutable & Hashable:** Designed to be immutable and hashable, making it suitable for use as a static argument in JAX functions (`jax.jit(static_argnums=...)`, `jax.pmap(static_broadcasted_argnums=...)`).
+    *   **JAX-Static:** Treated as compile-time constant by JAX transformations. Changes to `GraphDef` trigger recompilation.
+    *   **No Dynamic Values:** Does *not* contain the actual JAX arrays or other dynamic data held by Variables.
+
+### 2. `nnx.State`: The Dynamic Data
+
+`State` holds the actual numerical values and other dynamic data corresponding to the structure defined in `GraphDef`.
+
+*   **Purpose:** To contain all the dynamic (non-static) data from the `nnx.Module` graph in a JAX-compatible format.
+*   **Content:**
+    *   **Nested Structure:** A JAX pytree (usually `nnx.State`, which is dict-like) mirroring the module's attribute structure.
+    *   **Leaves (`nnx.VariableState`):** The leaves of this pytree are primarily [nnx.VariableState](nnx_variable___nnx_variablestate.mdc) objects. Each `VariableState` corresponds to an `nnx.Variable` in the original module and holds:
+        *   `value`: The actual data (e.g., JAX array).
+        *   `type`: The original Variable type (e.g., `nnx.Param`).
+        *   `metadata`: Any metadata associated with the Variable.
+    *   **Other Leaves:** Can occasionally contain raw JAX arrays if the module had attributes that were arrays but not wrapped in `nnx.Variable`.
+*   **Properties:**
+    *   **JAX Pytree:** Compatible with all JAX functions and transformations (`jax.tree_util.tree_map`, `jax.jit`, `jax.grad`, etc.). JAX operates on the `value` fields within the `VariableState` leaves.
+    *   **Dynamic:** Represents the part of the module that changes and is traced by JAX.
+
+### 3. Relationship and `split`/`merge`
+
+`GraphDef` and `State` are tightly coupled. `GraphDef` defines the structure, and `State` provides the corresponding values.
+
+*   **`nnx.split(module)`:** Traverses the `module` graph. It builds the `GraphDef` by recording node types, attribute names, and variable types/metadata. It uses a mechanism (internally `RefMap`) to detect shared objects; the first time a shared object is encountered, its full definition is added, and subsequent encounters result in a `NodeRef` pointing to the first definition. Simultaneously, it extracts the values from `nnx.Variable`s into `nnx.VariableState` objects, placing them in the `State` pytree at paths corresponding to their location in the module.
+*   **`nnx.merge(graphdef, state)`:** Uses the `GraphDef` as instructions to reconstruct the object graph. It instantiates nodes based on their types. When it encounters a `VariableDef`, it takes the next corresponding `VariableState` leaf from the `state` pytree and creates an `nnx.Variable` instance. When it encounters a `NodeRef` in the `GraphDef`, it retrieves the already-reconstructed object (using an internal `IndexMap`) ensuring shared references are correctly restored.
+
+### 4. Shared References (`NodeRef`)
+
+Handling shared references correctly is a key function of the `GraphDef`.
+
+```python
+# Using the 'model' from the previous example
+graphdef, state = nnx.split(model)
+
+# Simplified view of how GraphDef might represent sharing:
+# nodes = [
+#   NodeDef(MyModel, index=0, ...),       # Definition of MyModel
+#   NodeDef(SharedLinear, index=1, ...),  # Definition of SharedLinear (for block1)
+#   NodeDef(Linear, index=2, ...),        # Definition of the *shared* Linear layer
+#   VariableDef(Param, index=3, ...),     # Definition of Linear's kernel
+#   VariableDef(Param, index=4, ...),     # Definition of Linear's bias
+#   NodeDef(SharedLinear, index=5, ...),  # Definition of SharedLinear (for block2)
+#   NodeRef(index=2),                     # Reference to the shared Linear layer (index=2)
+#   VariableDef(Param, index=6, ...),     # Definition of other_param
+# ]
+# attributes = [
+#  (MyModel): ('block1', NodeAttr), ('block2', NodeAttr), ('other_param', NodeAttr),
+#  (SharedLinear @ 1): ('shared_layer', NodeAttr),
+#  (Linear @ 2): ('kernel', NodeAttr), ('bias', NodeAttr),
+#  (SharedLinear @ 5): ('shared_layer', NodeAttr),
+#  ...
+# ]
+```
+When `nnx.merge` processes this, upon encountering `NodeRef(index=2)` for `block2.shared_layer`, it looks up the object already created for index `2` (the `Linear` instance created for `block1.shared_layer`) and assigns that same instance, preserving the sharing. The `State` only contains the values for the *first* instance encountered (indices 3 and 4).
+
+## Internal Implementation Insights
+
+The core logic resides in `flax.nnx.graph`.
+
+*   **`GraphDef` Components (`flax/nnx/graph.py`):**
+    *   `graph.NodeDef`: Contains `type`, `index`, `outer_index`, `num_attributes`, `metadata`. Represents non-leaf nodes.
+    *   `graph.VariableDef`: Contains `type`, `index`, `outer_index`, `metadata`. Represents variable leaves.
+    *   `graph.NodeRef`: Contains `index`. Points to a previously defined `NodeDef` or `VariableDef` by its index.
+    *   `graph.GraphDef`: The top-level container holding lists of `nodes` (definitions) and `attributes` (mapping keys to types like `NodeAttr`, `ArrayAttr`, `Static`). `index` maps an object ID to its position in the `nodes` list during flattening/unflattening.
+*   **`State` Component (`flax/nnx/statelib.py`):**
+    *   `statelib.State`: A mutable mapping subclass, registered as a JAX pytree. Behaves like a nested dictionary.
+    *   `variablelib.VariableState`: The typical leaf node within `State`. Holds `type`, `value`, `_var_metadata`. Registered as a JAX pytree where `value` is dynamic and the rest is static.
+
+**`split` / `graph.flatten` Walkthrough:**
+
+1.  **Initialization:** Create an empty `RefMap` (maps object `id()` to an assigned index) and lists for `nodes`, `attributes`, and `leaves`.
+2.  **Traversal:** Recursively traverse the input `nnx.Module` graph.
+3.  **Reference Check:** For each graph node (Module or Variable), check if its `id()` is already in `RefMap`.
+    *   **If Yes:** Add a `NodeRef(ref_index[node])` to the `nodes` list. Stop recursion for this path.
+    *   **If No:** Assign a new index (`idx = len(ref_index)`), add the node to `RefMap`: `ref_index[node] = idx`. Proceed to process the node.
+4.  **Node Processing (New Node):**
+    *   **Variable:** Create a `VariableDef` (with type, index, metadata). Add it to `nodes`. Extract its value into a `VariableState` and append it to `leaves`.
+    *   **Module/Pytree:** Create a `NodeDef` (with type, index, metadata). Add it to `nodes`. Recursively call `_graph_flatten` for its attributes, appending to `attributes` and potentially `nodes` and `leaves`. Static values are wrapped in `graph.Static`.
+5.  **Output:** Return the final `GraphDef` (containing `nodes` and `attributes`) and the collected `leaves` (potentially structured as a `FlatState`). `nnx.split` then converts `FlatState` to the nested `State`.
+
+```mermaid
+sequenceDiagram
+    participant Split as nnx.split
+    participant Flatten as graph.flatten
+    participant RefMap as RefMap (id -> index)
+    participant GraphDef as GraphDef Builder
+    participant StateBuilder as State Builder
+    participant Model as MyModel Instance
+    participant SharedLinear as shared Linear Instance
+
+    Split->>Flatten: flatten(model)
+    activate Flatten
+    Flatten->>RefMap: Check id(model)
+    RefMap-->>Flatten: Not found
+    Flatten->>RefMap: Add model: 0
+    Flatten->>GraphDef: Add NodeDef(MyModel, index=0, ...)
+    Flatten->>Flatten: Recurse on model.block1
+    Flatten->>RefMap: Check id(model.block1)
+    RefMap-->>Flatten: Not found
+    Flatten->>RefMap: Add block1: 1
+    Flatten->>GraphDef: Add NodeDef(SharedLinear, index=1, ...)
+    Flatten->>Flatten: Recurse on block1.shared_layer
+    Flatten->>RefMap: Check id(shared Linear Instance)
+    RefMap-->>Flatten: Not found
+    Flatten->>RefMap: Add shared Linear: 2
+    Flatten->>GraphDef: Add NodeDef(Linear, index=2, ...)
+    Flatten->>Flatten: Recurse on Linear.kernel
+    Flatten->>RefMap: Check id(kernel Variable)
+    RefMap-->>Flatten: Not found
+    Flatten->>RefMap: Add kernel: 3
+    Flatten->>GraphDef: Add VariableDef(Param, index=3, ...)
+    Flatten->>StateBuilder: Add VariableState(kernel_value)
+    Flatten->>Flatten: Recurse on Linear.bias (similar: index=4)
+    Flatten->>Flatten: Recurse on model.block2
+    Flatten->>RefMap: Check id(model.block2)
+    RefMap-->>Flatten: Not found
+    Flatten->>RefMap: Add block2: 5
+    Flatten->>GraphDef: Add NodeDef(SharedLinear, index=5, ...)
+    Flatten->>Flatten: Recurse on block2.shared_layer
+    Flatten->>RefMap: Check id(shared Linear Instance)
+    RefMap-->>Flatten: Found, index=2
+    Flatten->>GraphDef: Add NodeRef(index=2)
+    Flatten->>Flatten: Recurse on model.other_param (similar: index=6)
+    Flatten-->>Split: Return (graphdef, flat_state)
+    deactivate Flatten
+    Split->>StateBuilder: Convert flat_state to nested State
+    StateBuilder-->>Split: Return nested_state
+    Split-->>User: Return (graphdef, nested_state)
+```
+
+**`merge` / `graph.unflatten` Walkthrough:** This process mirrors `flatten` but uses the `GraphDef` as the guide and an `IndexMap` (index -> reconstructed object) to handle `NodeRef`s.
+
+## Conclusion
+
+`GraphDef` and `GraphState` are the cornerstone of NNX's integration with JAX. `GraphDef` provides a static, hashable, JAX-compatible blueprint of an `nnx.Module`'s structure, including shared references. `GraphState` holds the corresponding dynamic data as a JAX pytree, primarily composed of `nnx.VariableState` leaves. The [NNX Functional API (split/merge/state/update/graphdef)](nnx_functional_api__split_merge_state_update_graphdef_.mdc) uses these structures to seamlessly convert between the stateful object-oriented representation and the functional representation required by JAX transformations, which are often invoked via the convenient [NNX Lifted Transforms (jit, grad, vmap, scan, etc.)](nnx_lifted_transforms__jit__grad__vmap__scan__etc__.mdc). Understanding this separation is key to mastering NNX.
+
+In the next chapter, we will look at how optimizers are handled within this framework with [nnx.Optimizer](nnx_optimizer.mdc).
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

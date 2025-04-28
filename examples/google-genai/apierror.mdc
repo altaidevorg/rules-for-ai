@@ -1,0 +1,259 @@
+---
+description: Details google-genai's APIError, the base exception for API service errors, parsing code, message, status from non-200 HTTP responses.
+globs: google/genai/errors.py
+alwaysApply: false
+---
+# Chapter 9: APIError
+
+In [Chapter 8: BaseApiClient](baseapiclient.mdc), we examined the core component responsible for handling HTTP communication with the Google Generative AI APIs. We saw that `BaseApiClient` sends requests and receives responses. But what happens when the API service itself encounters an error and returns a non-successful HTTP status code (like 400 Bad Request or 500 Internal Server Error)? This chapter introduces `APIError`, the structured exception class designed specifically for handling these API-level errors.
+
+## Motivation and Use Case
+
+When interacting with any external service, robust error handling is critical. Network issues, invalid inputs, temporary service outages, or permission problems can all lead to failed API calls. Simply relying on generic Python exceptions (like `httpx.HTTPStatusError`) wouldn't provide enough specific information about *why* the API call failed from the service's perspective. Developers need a way to:
+
+1.  **Distinguish API Service Errors:** Differentiate errors originating *from the Google GenAI service* (e.g., invalid API key, malformed request, resource not found) from general network or Python runtime errors.
+2.  **Access Structured Error Details:** Retrieve specific error information provided by the API, such as an error code, a descriptive message, and a status identifier (e.g., 'INVALID_ARGUMENT', 'PERMISSION_DENIED').
+3.  **Implement Targeted Error Handling:** Write `try...except` blocks that specifically catch API-related issues and potentially implement different logic based on the error details (e.g., retrying on transient server errors, logging specific client errors).
+
+`APIError` and its subclasses (`ClientError`, `ServerError`) fulfill these needs by providing a dedicated exception hierarchy for errors returned by the Google GenAI API.
+
+**Central Use Case:** Imagine you make an API call with an invalid parameter, such as referencing a non-existent model. The API will return a 4xx error. Your code should be able to catch this specific type of error and extract the details provided by the API.
+
+```python
+# Assuming 'client' is configured (Chapter 1)
+from google.genai import errors # Import the errors module
+from google.genai import types
+
+try:
+    response = client.models.generate_content(
+        model='gemini-invalid-model-name', # This model likely doesn't exist
+        contents='Why is the sky blue?'
+    )
+    print(response.text)
+except errors.APIError as e:
+    # Catch the specific APIError (or subclasses like ClientError)
+    print(f"--- An API Error Occurred ---")
+    print(f"HTTP Status Code: {e.code}") # e.g., 404 or 400
+    print(f"API Status: {e.status}")     # e.g., 'NOT_FOUND' or 'INVALID_ARGUMENT'
+    print(f"Message: {e.message}")       # Detailed message from the API
+    # print(f"Details: {e.details}")     # Raw error JSON from the API response
+    # print(f"Original Response: {e.response}") # The underlying httpx.Response
+except Exception as general_error:
+    # Catch other potential errors (network, etc.)
+    print(f"An unexpected error occurred: {general_error}")
+
+```
+This `try...except` block demonstrates how to specifically catch `errors.APIError`, allowing access to structured information like `e.code`, `e.status`, and `e.message` directly from the exception object.
+
+## Key Concepts
+
+*   **Base Exception:** `errors.APIError` is the primary exception class representing errors originating from the backend API service. All specific API errors raised by the SDK inherit from this class.
+*   **Subclasses:**
+    *   `errors.ClientError`: Inherits from `APIError`. Raised specifically for HTTP status codes in the 4xx range (e.g., 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found, 429 Resource Exhausted). These typically indicate a problem with the client's request.
+    *   `errors.ServerError`: Inherits from `APIError`. Raised specifically for HTTP status codes in the 5xx range (e.g., 500 Internal Server Error, 503 Service Unavailable). These usually indicate a problem on the Google backend servers, possibly transient.
+*   **Origin:** Instances of `APIError` (or its subclasses) are raised internally by the [BaseApiClient](baseapiclient.mdc). Specifically, the static methods `APIError.raise_for_response` (sync) and `APIError.raise_for_async_response` (async) are called after an HTTP request receives a response with a status code >= 400.
+*   **Attributes:** An `APIError` instance contains valuable information parsed from the API's error response body (typically JSON):
+    *   `code` (int): The HTTP status code (e.g., 400, 404, 500).
+    *   `status` (Optional[str]): A Google API standard error status string (e.g., 'INVALID_ARGUMENT', 'NOT_FOUND', 'PERMISSION_DENIED', 'INTERNAL').
+    *   `message` (Optional[str]): A human-readable error message provided by the API explaining the error.
+    *   `details` (Any): The raw, parsed JSON payload from the error response body. Can be useful for debugging complex errors but structure may vary.
+    *   `response` (Optional[Union['ReplayResponse', httpx.Response]]): The underlying `httpx.Response` object (or `ReplayResponse` during testing) that triggered the error. Provides access to full headers and raw response content if needed.
+*   **Raising Mechanism:** The `raise_for_response` methods check the `response.status_code`. If it's >= 400, they attempt to parse the response body as JSON. If successful, they extract the `code`, `message`, and `status` fields (looking in common locations like `error.message` or just `message`) and instantiate the appropriate exception (`ClientError` for 4xx, `ServerError` for 5xx, `APIError` otherwise) with these details. If JSON parsing fails, they use the raw response text as the message.
+
+## Usage (Error Handling)
+
+The primary way to use `APIError` is within `try...except` blocks when calling SDK methods that interact with the API.
+
+### Catching General API Errors
+
+Catching the base `errors.APIError` is sufficient for most cases where you just need to know an API call failed and perhaps log the message.
+
+```python
+from google.genai import errors
+from google.genai import types
+
+try:
+    # Example: Triggering a potential permission error (if API key is invalid)
+    model_info = client.models.get(model='gemini-1.5-flash')
+    print(f"Model Info: {model_info.display_name}")
+except errors.APIError as e:
+    print(f"API Error communicating with Google: {e.message}")
+    print(f"  Status Code: {e.code}")
+    print(f"  API Status: {e.status}")
+    # Decide how to handle (e.g., log, notify user, exit)
+```
+
+### Catching Specific Error Types
+
+If you need to differentiate between client-side issues (like invalid input) and server-side issues (which might be worth retrying), you can catch the specific subclasses.
+
+```python
+from google.genai import errors
+from google.genai import types
+import time
+
+retries = 3
+for attempt in range(retries):
+    try:
+        response = client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents="Tell me a story.",
+            config=types.GenerateContentConfig(temperature=1.5) # Potentially invalid temp
+        )
+        print("Success:", response.text)
+        break # Exit loop on success
+    except errors.ClientError as e:
+        # Likely an invalid argument or permission issue - unlikely to succeed on retry
+        print(f"Client Error (Attempt {attempt+1}/{retries}): {e.message} ({e.code} {e.status})")
+        print("Aborting due to client error.")
+        break # Don't retry client errors
+    except errors.ServerError as e:
+        # Maybe a transient issue on Google's end
+        print(f"Server Error (Attempt {attempt+1}/{retries}): {e.message} ({e.code} {e.status})")
+        if attempt < retries - 1:
+            print("Retrying after a short delay...")
+            time.sleep(2 ** attempt) # Exponential backoff
+        else:
+            print("Max retries reached for server error.")
+    except errors.APIError as e:
+        # Catch any other API errors (less common)
+        print(f"General API Error (Attempt {attempt+1}/{retries}): {e.message} ({e.code} {e.status})")
+        print("Aborting.")
+        break
+    except Exception as general_error:
+        print(f"Non-API Error: {general_error}")
+        print("Aborting.")
+        break
+
+```
+This demonstrates distinguishing `ClientError` (don't retry) from `ServerError` (retry with backoff).
+
+## Internal Implementation
+
+### High-Level Flow (`raise_for_response`)
+
+1.  **Receive Response:** The [BaseApiClient](baseapiclient.mdc)'s internal `_request` or `_async_request` method receives an `httpx.Response`.
+2.  **Check Status:** It immediately calls `errors.APIError.raise_for_response(response)` (or the async version).
+3.  **Status OK?** `raise_for_response` checks `response.status_code`. If it's 200, it returns immediately (`None`).
+4.  **Parse Error JSON:** If status is >= 400, it attempts to read the response body (`response.read()` or `await response.aread()`) and parse it as JSON (`response.json()`).
+5.  **Handle JSON Decode Error:** If parsing fails, it creates a basic `response_json` dictionary using the raw `response.text` as the message and `response.reason_phrase` as the status.
+6.  **Determine Exception Class:** Based on the `response.status_code`:
+    *   400-499: Selects `ClientError`.
+    *   500-599: Selects `ServerError`.
+    *   Other (<400 or >=600): Selects `APIError`.
+7.  **Instantiate and Raise:** It instantiates the chosen exception class, passing the `status_code`, the parsed (or constructed) `response_json`, and the original `response` object to the `__init__`. The `__init__` method extracts `code`, `message`, `status`, and `details` from the `response_json`. The exception instance is then raised.
+
+```mermaid
+sequenceDiagram
+    participant BAC as BaseApiClient._request
+    participant Httpx as httpx.Response
+    participant APIErrorCM as APIError (Class Methods)
+    participant APIErrorInit as APIError.__init__
+
+    BAC->>Httpx: Receives non-200 Response
+    BAC->>APIErrorCM: raise_for_response(response)
+    APIErrorCM->>Httpx: Check response.status_code (>= 400)
+    APIErrorCM->>Httpx: response.read() / response.json()
+    alt JSON Parsing Fails
+        APIErrorCM->>APIErrorCM: Construct basic error dict from text/reason
+    end
+    APIErrorCM->>APIErrorCM: Determine Exception Class (ClientError/ServerError/APIError)
+    APIErrorCM->>APIErrorInit: Instantiate Error(code, json_dict, response)
+    APIErrorInit-->>APIErrorCM: error_instance (with parsed attrs)
+    APIErrorCM-->>BAC: raise error_instance
+```
+
+### Code Dive (`google/genai/errors.py`)
+
+*   **`APIError.__init__`**:
+    ```python
+    # Simplified from google/genai/errors.py
+    class APIError(Exception):
+        # ... attributes ...
+        def __init__(
+            self,
+            code: int,
+            response_json: Any, # Parsed JSON or constructed dict
+            response: Optional[Union['ReplayResponse', httpx.Response]] = None,
+        ):
+            self.response = response
+            self.details = response_json # Store the raw error payload
+            # Attempt to extract standard fields
+            self.message = self._get_message(response_json)
+            self.status = self._get_status(response_json)
+            self.code = code if code else self._get_code(response_json)
+
+            # Construct the default exception message
+            super().__init__(f'{self.code} {self.status}. {self.details}')
+
+        # Helper methods to find fields in common locations
+        def _get_status(self, response_json: Any) -> Any:
+            return response_json.get(
+                'status', response_json.get('error', {}).get('status', None)
+            )
+        # ... similar for _get_message, _get_code ...
+    ```
+    The initializer stores the raw error details and attempts to extract the common `message`, `status`, and `code` fields into dedicated attributes for easier access.
+
+*   **Subclasses**:
+    ```python
+    # From google/genai/errors.py
+    class ClientError(APIError):
+      """Client error raised by the GenAI API."""
+      pass
+
+    class ServerError(APIError):
+      """Server error raised by the GenAI API."""
+      pass
+    ```
+    These are simple subclasses used for type differentiation based on the HTTP status code range (4xx vs 5xx). They don't add extra logic beyond inheriting from `APIError`.
+
+*   **`raise_for_response` (and `raise_for_async_response`)**:
+    ```python
+    # Simplified from google/genai/errors.py
+    @classmethod
+    def raise_for_response(
+        cls, response: Union['ReplayResponse', httpx.Response]
+    ) -> None:
+        """Raises an error with detailed error message if the response has an error status."""
+        if response.status_code == 200:
+            return # Success, do nothing
+
+        if isinstance(response, httpx.Response):
+            try:
+                response.read() # Ensure body is loaded
+                response_json = response.json() # Try parsing JSON
+            except json.decoder.JSONDecodeError:
+                # If not JSON, construct a basic error dict
+                message = response.text
+                response_json = {
+                    'message': message,
+                    'status': response.reason_phrase,
+                }
+        else: # ReplayResponse case
+            response_json = response.body_segments[0].get('error', {})
+
+        status_code = response.status_code
+        # Choose exception class based on status code
+        if 400 <= status_code < 500:
+            raise ClientError(status_code, response_json, response)
+        elif 500 <= status_code < 600:
+            raise ServerError(status_code, response_json, response)
+        else:
+            # For other error codes (e.g., 3xx if redirects fail, or >600)
+            raise cls(status_code, response_json, response)
+
+    # raise_for_async_response is nearly identical but uses 'await response.aread()'
+    ```
+    This class method centralizes the logic for checking the status code, parsing the error response (with fallback for non-JSON bodies), selecting the appropriate `APIError` subclass, and raising the exception.
+
+## Conclusion
+
+`APIError` provides a robust and structured way to handle errors originating specifically from the Google Generative AI API service. Raised by the underlying [BaseApiClient](baseapiclient.mdc) when non-200 responses are encountered, it encapsulates crucial details like the HTTP `code`, API `status`, and descriptive `message` parsed from the error response. By using `try...except` blocks targeting `APIError`, `ClientError`, or `ServerError`, developers can build more resilient applications that appropriately handle API-specific failures, distinguishing them from other runtime issues.
+
+This chapter concludes our exploration of the core mechanisms within the `google-genai` SDK, covering client configuration, data structures, API modules, conversational state, function calling, pagination, data transformation, HTTP communication, and error handling. Armed with this knowledge, you should have a solid understanding of how the SDK operates internally.
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

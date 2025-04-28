@@ -1,0 +1,320 @@
+---
+description: Explains google-genai internal Transformers (`t_` functions) in _transformers.py, which adapt user types to API formats.
+globs: google/genai/_transformers.py
+alwaysApply: false
+---
+# Chapter 7: Transformers (`t_` functions)
+
+In the previous chapter, [Pager / AsyncPager](pager___asyncpager.mdc), we saw how the SDK simplifies iterating over paginated API results. Now, we delve into a crucial internal mechanism: the Transformer functions, typically prefixed with `t_`. These functions form an essential adaptation layer, translating between the user-friendly data types you interact with in the SDK and the specific formats required by the backend Google Generative AI APIs.
+
+## Motivation and Use Case
+
+Interacting directly with APIs often involves constructing complex JSON or Protobuf messages with specific field names, nested structures, and precise formatting rules (e.g., resource names like `models/gemini-pro` or `projects/my-proj/locations/us-central1/cachedContents/abc`). Manually handling these details for every SDK call would make the code verbose, error-prone, and tightly coupled to the API's specific implementation details.
+
+Transformers (`t_` functions) solve this by acting as an *Adapter* layer. They take high-level, intuitive Python types used in the SDK's public interface—such as strings, `PIL.Image` objects, simple dictionaries, lists, Pydantic models ([`types.Content`](content___part.mdc), [`types.Part`](content___part.mdc)), or Python functions ([Function Calling Utilities](function_calling_utilities.mdc))—and convert them into the exact dictionary/JSON structures the backend API expects. They also perform the reverse transformation for API responses, converting API data back into convenient SDK objects.
+
+**Central Use Case:** Consider a simple call to generate content:
+
+```python
+# Assuming 'client' is configured (Chapter 1)
+from google.genai import types
+import PIL.Image
+
+# Load an image (replace with your image path)
+try:
+    img = PIL.Image.open('path/to/your/image.jpg')
+except FileNotFoundError:
+    print("Image file not found, using placeholder text.")
+    img = "Describe this image." # Use text if image fails
+
+# Make the call with user-friendly types
+response = client.models.generate_content(
+    model='gemini-1.5-flash', # Simple model string
+    contents=["What is in this picture?", img] # List of string and PIL Image
+)
+
+print(response.text)
+```
+
+Behind the scenes, before this request is sent to the API:
+1.  `t_model` transforms the string `'gemini-1.5-flash'` into the required resource name format (e.g., `'models/gemini-1.5-flash'` or potentially a Vertex AI formatted name).
+2.  `t_contents` (which uses `t_content` and `t_part`) transforms the list `["What is in this picture?", img]` into a structured `list[types.Content]` like:
+    ```python
+    # Simplified representation of the transformed structure
+    [
+        types.Content(role='user', parts=[
+            types.Part(text="What is in this picture?"),
+            types.Part(inline_data=types.Blob(mime_type='image/jpeg', data=...)) # Image converted to Blob
+        ])
+    ]
+    ```
+3.  This structured list is then used to build the final JSON payload sent to the API.
+
+The `t_` functions hide this complexity, allowing you to work with more natural Python types.
+
+## Key Concepts
+
+*   **Adapter Pattern:** Transformers act as Adapters, mediating between the SDK's public interface (designed for developer convenience) and the specific interface required by the backend API (JSON/dict format).
+*   **Bidirectional Transformation:** Transformers work in both directions:
+    *   **Request:** Convert user input (strings, PIL Images, callables, simple dicts, SDK Pydantic models) into the JSON/dict structure for the API request body.
+    *   **Response:** Convert the JSON/dict structure from the API response back into SDK Pydantic models (like `types.GenerateContentResponse`, `types.TuningJob`, `types.File`) or simpler types where appropriate.
+*   **Type Conversion:** Handling various input types:
+    *   Strings -> `types.Part(text=...)` or formatted resource names.
+    *   `PIL.Image` -> `types.Part(inline_data=types.Blob(...))` using helpers like `pil_to_blob`.
+    *   Python functions/methods -> `types.FunctionDeclaration` schema (via `t_tool`, `t_schema`).
+    *   Dicts -> Pydantic models (e.g., `types.GenerateContentConfig`) or specific API request fields.
+*   **Formatting and Validation:**
+    *   **Resource Names:** `t_model`, `t_cached_content_name`, `t_file_name`, and the internal `_resource_name` ensure correct prefixes (e.g., `models/`, `tunedModels/`, `cachedContents/`) and handle Vertex AI's project/location prefixes.
+    *   **Content Structure:** `t_content`, `t_part`, `t_contents` build the correct `Content` and `Part` structures, assigning roles (`user`/`model`) and handling multi-modal inputs.
+    *   **Schema Generation:** `t_schema` (used by `t_tool` and `FunctionDeclaration.from_callable`) introspects Python functions/Pydantic models to generate OpenAPI-compatible JSON schemas for function calling ([Chapter 5: Function Calling Utilities](function_calling_utilities.mdc)).
+    *   **Configuration:** Transforming configuration objects (like `types.GenerateContentConfig`) into the specific fields expected by the API (e.g., `safetySettings`, `generationConfig`).
+*   **Location:** These functions primarily reside in `google/genai/_transformers.py`. Many API modules also contain specific `_to_mldev` / `_to_vertex` / `_from_mldev` / `_from_vertex` converter functions (often auto-generated, see `google/genai/_live_converters.py` for examples) that utilize the core `t_` transformers.
+
+## Usage (Implicit)
+
+You will rarely, if ever, call `t_` functions directly in typical application code. They are **internal implementation details** of the SDK.
+
+*   **API Module Integration:** Methods within the [API Modules (Models, Chats, Files, Tunings, Caches, Batches, Operations, Live)](api_modules__models__chats__files__tunings__caches__batches__operations__live_.mdc) (e.g., `client.models.generate_content`, `client.files.upload`, `client.tunings.tune`) call these transformers internally before constructing the request payload sent via the [BaseApiClient](baseapiclient.mdc).
+*   **Chat Integration:** The [Chat / AsyncChat](chat___asyncchat.mdc) `send_message` method uses `t_content` to process the user's message before adding it to the history and calling `generate_content`.
+*   **Function Calling:** Automatic function calling heavily relies on `t_tool` and `t_schema` for schema generation and `t_function_response` for formatting results.
+
+**Why Understand Them?**
+1.  **Debugging:** If you encounter errors related to data formatting or unexpected API request structures, understanding that transformers are involved can help pinpoint the issue (e.g., an unsupported input type, incorrect resource name format). Stack traces might originate from or pass through `_transformers.py`.
+2.  **Understanding SDK Behavior:** Knowing about transformers clarifies *how* the SDK achieves its user-friendliness and handles variations between the Gemini and Vertex AI APIs.
+3.  **Advanced Use Cases/Contributions:** If extending the SDK or working with edge cases, direct interaction or modification might be necessary (though generally discouraged).
+
+## Internal Implementation
+
+### High-Level Flow
+
+When an API module method like `Models.generate_content` is called:
+
+1.  **Input Received:** The method receives user arguments (e.g., `model='gemini-pro'`, `contents=['Describe', img]`, `config=...`).
+2.  **Transformer Invocation:** The method calls the relevant `t_` functions:
+    *   `t_model('gemini-pro')` -> formats the model name.
+    *   `t_contents(['Describe', img])` -> converts the list into `list[types.Content]`.
+    *   `t_schema` might be called internally if tools/functions are provided in `config`.
+    *   Other transformers handle `config` parameters (e.g., `safety_settings`, `generation_config`).
+3.  **Request Dictionary Built:** The results from the transformers are used to assemble the final dictionary representing the JSON payload for the API. Platform-specific converters (`_to_mldev`/`_to_vertex`) often orchestrate this.
+4.  **API Call:** The prepared dictionary is passed to `self._api_client.request(...)` ([BaseApiClient](baseapiclient.mdc)).
+5.  **Response Received:** The `BaseApiClient` returns the API response dictionary.
+6.  **Response Transformation:** Platform-specific converters (`_from_mldev`/`_from_vertex`) parse the response dictionary, potentially using `t_` functions (or equivalent logic) to populate SDK Pydantic models (e.g., `types.GenerateContentResponse`).
+7.  **Return Value:** The structured SDK response object is returned to the user.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant ModMethod as API Module Method (e.g., generate_content)
+    participant Tf as Transformers (t_*)
+    participant BAC as BaseApiClient
+    participant API as Backend API
+
+    User->>ModMethod: Call(model_str, contents_list, ...)
+    ModMethod->>Tf: t_model(model_str)
+    Tf-->>ModMethod: formatted_model_name
+    ModMethod->>Tf: t_contents(contents_list)
+    Tf-->>ModMethod: structured_contents (list[Content])
+    ModMethod->>Tf: (Transform config, tools, etc.)
+    Tf-->>ModMethod: structured_config, structured_tools
+    ModMethod->>BAC: request(method, path, {model: formatted_model_name, contents: structured_contents, ...})
+    BAC->>API: Send HTTP Request (JSON payload)
+    API-->>BAC: Receive HTTP Response (JSON payload)
+    BAC-->>ModMethod: response_dict
+    ModMethod->>Tf: (Transform response_dict using _from_mldev/vertex helpers)
+    Tf-->>ModMethod: Structured SDK Response (e.g., GenerateContentResponse)
+    ModMethod-->>User: Return SDK Response Object
+```
+
+### Code Snippets (`google/genai/_transformers.py`)
+
+*   **`t_model(client, model)`:** Formats the model name string.
+    ```python
+    # Simplified from google/genai/_transformers.py
+    def t_model(client: _api_client.BaseApiClient, model: str) -> str:
+        if not model:
+            raise ValueError('model is required.')
+        if client.vertexai:
+            # Handle Vertex specific formatting (publishers/, projects/, etc.)
+            if (
+                model.startswith('projects/') or
+                model.startswith('models/') or
+                model.startswith('publishers/')
+            ):
+                return model
+            elif '/' in model: # e.g., "google/gemini-1.5-flash"
+                publisher, model_id = model.split('/', 1)
+                return f'publishers/{publisher}/models/{model_id}'
+            else: # e.g., "gemini-1.5-flash"
+                return f'publishers/google/models/{model}'
+        else: # Gemini API
+            if model.startswith('models/') or model.startswith('tunedModels/'):
+                return model
+            else:
+                return f'models/{model}' # Add 'models/' prefix if missing
+    ```
+    This ensures the model identifier sent to the API matches the expected format for either Gemini (`models/...`) or Vertex AI (`publishers/.../...`).
+
+*   **`_resource_name(client, resource_name, collection_identifier)`:** Internal helper for adding prefixes.
+    ```python
+    # Simplified from google/genai/_transformers.py
+    def _resource_name(
+        client: _api_client.BaseApiClient,
+        resource_name: str, *, collection_identifier: str, ...
+    ) -> str:
+        # ... logic to check if prefixes are needed ...
+        if client.vertexai:
+            # Add 'projects/{proj}/locations/{loc}/' if missing
+            if resource_name.startswith('projects/'):
+                return resource_name
+            elif resource_name.startswith('locations/'):
+                return f'projects/{client.project}/{resource_name}'
+            # ... more complex logic for prepending collection_identifier ...
+            else: # Assume just the ID or collection/ID
+                 prefix = f'projects/{client.project}/locations/{client.location}/'
+                 # ... logic to maybe add collection_identifier ...
+                 return prefix + resource_name # Simplified return
+        else: # Gemini API
+            # Add 'collection_identifier/' if missing and depth matches
+            if not resource_name.startswith(f'{collection_identifier}/'):
+                 # ... depth check logic ...
+                 return f'{collection_identifier}/{resource_name}'
+            else:
+                 return resource_name
+    ```
+    This handles the platform-specific prefixing required for resource names (like Cached Content or Files).
+
+*   **`pil_to_blob(img)`:** Converts a PIL Image to a `types.Blob`.
+    ```python
+    # Simplified from google/genai/_transformers.py
+    import io
+    def pil_to_blob(img: Any) -> types.Blob:
+        # ... (import PIL.PngImagePlugin check) ...
+        bytesio = io.BytesIO()
+        # Determine format (PNG for RGBA, JPEG otherwise)
+        if img.mode == 'RGBA': # Simplified check
+            img.save(bytesio, format='PNG')
+            mime_type = 'image/png'
+        else:
+            img.save(bytesio, format='JPEG')
+            mime_type = 'image/jpeg'
+        bytesio.seek(0)
+        data = bytesio.read()
+        return types.Blob(mime_type=mime_type, data=data) # Data is base64 encoded by Pydantic
+    ```
+    This function takes a `PIL.Image` object, saves it to an in-memory byte stream in either PNG or JPEG format, and wraps the bytes and MIME type in an SDK `Blob` object.
+
+*   **`t_part(part)`:** Converts various inputs into a `types.Part`.
+    ```python
+    # Simplified from google/genai/_transformers.py
+    def t_part(part: Optional[types.PartUnionDict]) -> types.Part:
+        # ... (import PIL.Image check) ...
+        if part is None: raise ValueError('content part is required.')
+        if isinstance(part, str):
+            return types.Part(text=part)
+        if PIL_Image is not None and isinstance(part, PIL_Image):
+            return types.Part(inline_data=pil_to_blob(part))
+        # ... (handle types.File) ...
+        if isinstance(part, dict):
+            return types.Part.model_validate(part) # Validate/parse dict
+        if isinstance(part, types.Part):
+            return part # Already the correct type
+        raise ValueError(f'Unsupported content part type: {type(part)}')
+    ```
+    This shows how a simple string becomes `Part(text=...)`, a PIL Image becomes `Part(inline_data=...)`, and dictionaries or existing `Part` objects are handled.
+
+*   **`t_content(client, content)`:** Converts inputs into a `types.Content`.
+    ```python
+    # Simplified from google/genai/_transformers.py
+    def t_content(client: _api_client.BaseApiClient, content: Optional[ContentType]) -> types.Content:
+        if content is None: raise ValueError('content is required.')
+        if isinstance(content, types.Content): return content
+        if isinstance(content, dict):
+            try: # Try parsing as Content first
+                return types.Content.model_validate(content)
+            except pydantic.ValidationError: # If fails, try parsing as Part
+                possible_part = types.Part.model_validate(content)
+                # Infer role based on part type (function_call implies model)
+                role = 'model' if possible_part.function_call else 'user'
+                return types.Content(role=role, parts=[possible_part])
+        # If input is a single Part or Part-compatible type
+        single_part = t_part(content) # Uses t_part internally
+        role = 'model' if single_part.function_call else 'user'
+        return types.Content(role=role, parts=[single_part])
+    ```
+    This demonstrates converting dictionaries or single parts/strings/images into a full `Content` object, intelligently assigning the `role` based on the input.
+
+*   **`t_contents(client, contents)`:** Converts a list of inputs into `list[types.Content]`.
+    ```python
+    # Simplified logic from google/genai/_transformers.py t_contents
+    def t_contents(client, contents):
+        if contents is None: raise ValueError('contents are required.')
+        if not isinstance(contents, list): # Handle single item case
+            return [t_content(client, contents)]
+
+        result = []
+        accumulated_parts = []
+        # Iterates through the input list 'contents'
+        for item in contents:
+            if isinstance(item, types.Content): # If it's already Content
+                # Append any accumulated parts first
+                # ... (logic to create Content from accumulated_parts) ...
+                result.append(item)
+            elif _is_part(item): # Check if it's a str, PIL, Part, dict(Part)
+                # Handle accumulating consecutive parts of same role (user/model)
+                # ... (logic using t_part and role checking) ...
+                accumulated_parts.append(t_part(item))
+            elif isinstance(item, dict): # Assume it's a Content dict
+                # Append accumulated parts first
+                # ...
+                result.append(types.Content.model_validate(item))
+            else:
+                raise ValueError(...) # Unsupported type in list
+
+        # Append any remaining accumulated parts
+        # ...
+        return result
+    ```
+    This function is sophisticated. It handles lists containing a mix of `Content` objects and individual `Part`-compatible types (like strings or images). It groups consecutive parts intended for the *same role* (user or model) into a single `Content` object.
+
+*   **`t_tool(client, origin)` and `t_tools(client, origin)`:** Handles tool/function declaration conversion.
+    ```python
+    # Simplified from google/genai/_transformers.py
+    def t_tool(client, origin: Any) -> Optional[types.Tool]:
+        if inspect.isfunction(origin) or inspect.ismethod(origin):
+            # Use FunctionDeclaration helper which internally uses t_schema
+            f_decl = types.FunctionDeclaration.from_callable(client=client, callable=origin)
+            return types.Tool(function_declarations=[f_decl])
+        elif isinstance(origin, dict):
+            return types.Tool.model_validate(origin)
+        elif isinstance(origin, types.Tool):
+            return origin
+        # ... handle other tool types like Retrieval ...
+        return None # Or raise error
+
+    def t_tools(client, origin: list[Any]) -> list[types.Tool]:
+        # ... (Handles list input, groups function declarations into one Tool) ...
+        function_declarations = []
+        other_tools = []
+        for item in origin:
+            tool = t_tool(client, item)
+            if tool and tool.function_declarations:
+                function_declarations.extend(tool.function_declarations)
+            elif tool:
+                other_tools.append(tool)
+
+        if function_declarations:
+             other_tools.append(types.Tool(function_declarations=function_declarations))
+        return other_tools
+    ```
+    These functions (along with `t_schema` and `FunctionDeclaration.from_callable`) manage the conversion of Python functions or `Tool` dictionaries into the structured `types.Tool` format required by the API, enabling function calling.
+
+## Conclusion
+
+The Transformer (`t_`) functions are the unsung heroes of the `google-genai` SDK's developer experience. Operating internally, they form a vital Adapter layer that translates between intuitive Python objects and the specific, often complex, JSON/dictionary formats demanded by the backend APIs. They handle nuances of resource naming, multi-modal content structuring, function schema generation, and configuration formatting for both Gemini and Vertex AI targets. While you typically won't call them directly, understanding their role is key to effectively debugging and comprehending the SDK's internal workings.
+
+These transformers prepare the data that is ultimately sent over the network. The next chapter, [BaseApiClient](baseapiclient.mdc), examines the core component responsible for handling the actual HTTP communication with the API endpoints.
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

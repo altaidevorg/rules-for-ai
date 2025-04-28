@@ -1,0 +1,299 @@
+---
+description: Explains google-genai's Pager/AsyncPager for simplifying iteration over paginated API list results (e.g., models.list, files.list).
+globs: google/genai/pagers.py
+alwaysApply: false
+---
+# Chapter 6: Pager / AsyncPager
+
+In [Chapter 5: Function Calling Utilities](function_calling_utilities.mdc), we explored how the SDK facilitates interactions with external tools. Now, let's turn our attention to another common API interaction pattern: handling large lists of results that the API returns in chunks, or *pages*. This chapter introduces the `Pager` and `AsyncPager` classes, which abstract the complexities of pagination.
+
+## Motivation and Use Case
+
+When you request a list of resources from an API (like available models using `models.list`, uploaded files using `files.list`, or tuning jobs using `tunings.list`), the total number of items might be very large. Returning the entire list in a single response could be inefficient or even infeasible due to size limits.
+
+To handle this, APIs often implement *pagination*. The API returns a manageable subset of the list (a *page*) along with a `next_page_token`. To get the next subset of results, you make another API request, including this token. This process repeats until all items have been retrieved (indicated by the absence of a `next_page_token` in the response).
+
+Managing this token passing and repeated request cycle manually adds boilerplate code to your application. The `Pager` (for synchronous operations) and `AsyncPager` (for asynchronous operations) classes implement the Pager design pattern to hide this complexity. They act as iterators that automatically fetch subsequent pages when needed.
+
+**Central Use Case:** You want to process *all* available generative models, potentially hundreds, without worrying about fetching page by page.
+
+```python
+# Assuming 'client' is configured (e.g., using genai.Client(api_key=...))
+from google import genai
+
+# models.list() returns a Pager object
+model_pager = client.models.list()
+
+# Iterate directly over the pager
+print("Processing all available models:")
+count = 0
+for model in model_pager:
+    # The pager automatically fetches the next page when the current one is exhausted
+    # We only print basic info here for brevity
+    if "generateContent" in model.supported_generation_methods:
+        print(f"- Found model: {model.name} ({model.display_name})")
+        count += 1
+print(f"\nTotal models processed: {count}")
+
+# The pager transparently handled fetching multiple pages if necessary.
+```
+This example demonstrates how the `Pager` allows simple iteration over potentially large result sets without explicit pagination logic.
+
+## Key Concepts
+
+### Pagination Abstraction
+
+*   **Encapsulation:** The core idea is that the `Pager` object holds the state necessary for pagination:
+    *   The results of the *current* page.
+    *   The method needed to fetch the *next* page (usually the original list method itself).
+    *   The `next_page_token` (or equivalent configuration) required for the next API call.
+*   **Hiding Details:** The user interacts with the `Pager` as if it were a single, large list, without needing to know about the underlying page tokens or multiple API calls.
+
+### Iterator Interface
+
+*   **`__iter__` / `__next__` (Pager):** The synchronous `Pager` implements the standard Python iterator protocol. When you use it in a `for` loop, Python calls `__iter__` (which returns `self`) and then repeatedly calls `__next__`. Inside `__next__`, if the current page's items are exhausted *and* a `next_page_token` exists, the `Pager` automatically calls its internal `next_page()` method to fetch the next batch of results before returning the next item. If there are no more items and no next page, it raises `StopIteration`.
+*   **`__aiter__` / `__anext__` (AsyncPager):** The `AsyncPager` implements the asynchronous iterator protocol. Used with `async for`, it behaves similarly, but `__anext__` calls `await self.next_page()` when fetching subsequent pages, making the operation non-blocking. If there are no more items and no next page, it raises `StopAsyncIteration`.
+
+### Explicit Page Navigation
+
+*   **`next_page()` (Pager):** Allows you to manually trigger fetching the next page of results. It makes the API call, updates the pager's internal state (current page and next token), and returns the list of items on the newly fetched page. Raises `IndexError` if no `next_page_token` was available (i.e., you're already on the last page).
+*   **`await next_page()` (AsyncPager):** The asynchronous equivalent of `next_page()`.
+
+### State Management
+
+*   **`page` Property:** Provides access to the list of items currently held by the pager (the results from the most recently fetched page).
+*   **`config` Property:** A dictionary holding the parameters needed to fetch the next page, including the crucial `page_token`. It also includes other parameters like `page_size` that were part of the original request.
+*   **`page_size` Property:** Returns the maximum number of items fetched per page.
+
+## Usage
+
+You typically don't instantiate `Pager` or `AsyncPager` directly. API module methods that return paginated lists (like `list` methods in `Models`, `Files`, `Tunings`, `Caches`, `Batches`) return an instance of `Pager` or `AsyncPager`.
+
+### Implicit Iteration (Recommended for most cases)
+
+```python
+# Synchronous iteration (e.g., listing files for Gemini API)
+# Ensure client is configured for Gemini API as Files API is not on Vertex
+if not client.vertexai:
+    print("\nListing files (sync):")
+    try:
+        file_pager = client.files.list(config={'page_size': 5}) # Small page size for demo
+        for file_info in file_pager:
+            print(f"- File: {file_info.name}")
+    except ValueError as e:
+        print(f"  Skipping: {e}") # Handle case where client is Vertex
+    except Exception as e:
+        print(f"  Error listing files: {e}")
+else:
+    print("\nSkipping file listing (sync) - Files API not supported on Vertex.")
+
+
+# Asynchronous iteration (e.g., listing tuning jobs)
+import asyncio
+
+async def list_tuning_jobs_async():
+    # Ensure client is configured
+    print("\nListing tuning jobs (async):")
+    try:
+        job_pager = await client.aio.tunings.list(config={'page_size': 2})
+        async for job in job_pager:
+            print(f"- Tuning Job: {job.name} (State: {job.state})")
+        # Check if any jobs were found
+        if not job_pager.page and not job_pager.config.get('page_token'):
+            print("  (No tuning jobs found or only one page)")
+    except Exception as e:
+        print(f"  Error listing tuning jobs: {e}")
+
+# asyncio.run(list_tuning_jobs_async()) # Uncomment to run
+```
+These examples show the most common way to use pagers: simple iteration that automatically handles fetching.
+
+### Explicit Page Handling
+
+Sometimes you might want to process pages individually or inspect the state.
+
+```python
+# Synchronous explicit paging
+print("\nExplicitly paging through models:")
+try:
+    model_pager = client.models.list(config={'page_size': 3}) # Small page size
+    page_num = 1
+    while True:
+        print(f"--- Page {page_num} ---")
+        if not model_pager.page:
+            print("  (Empty page)")
+            break # Exit if current page is empty
+
+        for model in model_pager.page: # Access current page via .page
+            print(f"- Model: {model.name}")
+
+        # Check if there's a next page token before calling next_page()
+        if not model_pager.config.get('page_token'):
+            print("\nNo more pages.")
+            break
+
+        # Manually fetch the next page
+        print("Fetching next page...")
+        model_pager.next_page()
+        page_num += 1
+
+except IndexError:
+     print("\nCaught IndexError: Reached end of pages.")
+except Exception as e:
+    print(f"Error during explicit paging: {e}")
+
+# Async explicit paging follows a similar structure using `await async_pager.next_page()`
+```
+This shows how to access the current `page` and manually trigger `next_page()`.
+
+## Internal Implementation
+
+### High-Level Flow (Creating and Using a Pager)
+
+1.  **Initial Request:** The user calls an SDK list method (e.g., `client.models.list(config={'page_size': 10})`).
+2.  **First API Call:** The SDK method (e.g., `Models._list`) makes the first API call to the backend using the [`BaseApiClient`](baseapiclient.mdc), potentially including parameters like `pageSize`.
+3.  **Receive First Page:** The API returns the first page of results (e.g., 10 models) and, if more results exist, a `next_page_token`.
+4.  **Pager Instantiation:** The SDK list method receives the response, extracts the list of items and the `next_page_token`. It then creates a `Pager` (or `AsyncPager`) instance, passing:
+    *   The name of the list field in the response (e.g., `'models'`).
+    *   A reference to the SDK method itself (`Models._list` or `AsyncModels._list`).
+    *   The initial API response object containing the first page and token.
+    *   The original request configuration (including `page_size`).
+5.  **Iteration Trigger:** The user starts iterating (e.g., `for model in pager:`).
+6.  **Yielding Items:** The pager's `__next__` (or `__anext__`) method yields items from its current `_page` list.
+7.  **Page Exhausted:** When the current `_page` is exhausted (`_idx >= len(self)`), `__next__` checks if a `next_page_token` exists in its `_config`.
+8.  **Fetch Next Page:** If a token exists, `__next__` calls `self.next_page()` (or `await self.next_page()` for async).
+9.  **Subsequent API Call:** `next_page()` uses the stored request method (`self._request`) and the stored config (`self._config`, which includes the `page_token`) to make another API call via the `BaseApiClient`.
+10. **Receive Next Page:** The API returns the next page of results and potentially a new `next_page_token`.
+11. **Update Pager State:** The response is used to update the pager's internal state (`self._init_next_page` is called), replacing `self._page` with the new results and updating `self._config['page_token']` with the new token (or removing it if it's the last page).
+12. **Continue Iteration:** `__next__` resets its internal index (`_idx`) and continues yielding items from the newly fetched page.
+13. **End of Iteration:** If `next_page()` is called (or attempted by `__next__`) when no `next_page_token` exists, `IndexError` is raised by `next_page()`, which `__next__` catches and converts to `StopIteration` (or `StopAsyncIteration`).
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant ListMethod as SDK List Method (e.g., models.list)
+    participant Pager as Pager Instance
+    participant APIClient as BaseApiClient
+    participant API as Backend API
+
+    User->>ListMethod: Call list(config={page_size: 5})
+    ListMethod->>APIClient: request(GET, '/models', {pageSize: 5})
+    APIClient->>API: Send HTTP Request
+    API-->>APIClient: Receive Response (page1, token1)
+    APIClient-->>ListMethod: Return response_obj
+    ListMethod->>Pager: Instantiate Pager(name='models', request=ListMethod._list, response=response_obj, config={page_size: 5})
+    Pager-->>ListMethod: pager instance
+    ListMethod-->>User: Return pager instance
+
+    User->>Pager: Iterate (for item in pager)
+    Pager->>Pager: __next__() -> yields items from page1
+    Note over Pager: Page 1 exhausted
+    Pager->>Pager: __next__() calls self.next_page()
+    Pager->>ListMethod: Call _list(config={page_size: 5, page_token: token1}) via self._request
+    ListMethod->>APIClient: request(GET, '/models', {pageSize: 5, pageToken: token1})
+    APIClient->>API: Send HTTP Request
+    API-->>APIClient: Receive Response (page2, token2)
+    APIClient-->>ListMethod: Return response_obj2
+    ListMethod-->>Pager: Return response_obj2 to next_page()
+    Pager->>Pager: _init_next_page(response_obj2) - Updates internal page and token
+    Pager->>Pager: __next__() -> yields items from page2
+    Note over Pager: ... continues until no more tokens ...
+    Pager->>User: Raises StopIteration
+```
+
+### Code Dive (`google/genai/pagers.py`)
+
+The core logic resides in the `_BasePager`, `Pager`, and `AsyncPager` classes.
+
+*   **Initialization (`_BasePager._init_page`):**
+    ```python
+    # Simplified from google/genai/pagers.py
+    class _BasePager(Generic[T]):
+        def _init_page(
+            self,
+            name: PagedItem,
+            request: Callable[..., Any], # The SDK list method
+            response: Any,             # The raw API list response object
+            config: Any,               # Original request config
+        ) -> None:
+            self._name = name
+            self._request = request # Store the function to call for next page
+
+            # Extract the list of items for the current page
+            self._page = getattr(response, self._name) or []
+            self._idx = 0 # Reset item index for the new page
+
+            # Prepare config for the *next* request
+            if not config:
+                request_config = {}
+            elif isinstance(config, dict):
+                request_config = copy.deepcopy(config)
+            else:
+                request_config = dict(config)
+            # Store the token needed for the next page request
+            request_config['page_token'] = getattr(response, 'next_page_token', None)
+            self._config = request_config # Store config for next call
+
+            self._page_size: int = request_config.get('page_size', len(self._page))
+    ```
+    This method extracts the current page's items (`_page`) and prepares the configuration (`_config`) needed to fetch the *next* page by storing the `next_page_token` and the original request parameters. It also stores the callable (`_request`) that will be used to make the next API call.
+
+*   **Synchronous Iteration (`Pager.__next__`)**
+    ```python
+    # Simplified from google/genai/pagers.py
+    class Pager(_BasePager[T]):
+        def __next__(self) -> T:
+            # Check if we are past the end of the current page
+            if self._idx >= len(self):
+                try:
+                    # Attempt to fetch the next page
+                    self.next_page()
+                except IndexError:
+                    # No more pages exist, stop iteration
+                    raise StopIteration
+
+            # Get the item at the current index
+            item = self.page[self._idx]
+            self._idx += 1 # Move to the next item index
+            return item
+
+        def __iter__(self) -> Iterator[T]:
+            self._idx = 0 # Reset index when starting iteration
+            return self
+    ```
+    `__next__` first checks if it needs more items. If the current page (`self.page`) is exhausted, it calls `self.next_page()`. If `next_page()` raises `IndexError` (meaning no more pages), `StopIteration` is raised. Otherwise, `next_page()` updates `self.page`, and `__next__` proceeds to return the next item from the (now updated) page.
+
+*   **Fetching the Next Page (`Pager.next_page`)**
+    ```python
+    # Simplified from google/genai/pagers.py
+    class Pager(_BasePager[T]):
+        # ... __init__, __next__, __iter__ ...
+
+        def next_page(self) -> list[T]:
+            # Check if a next page token exists in the current config
+            if not self.config.get('page_token'):
+                raise IndexError('No more pages to fetch.')
+
+            # Call the stored SDK list method (_request) with the current config
+            # (which includes the page_token) to make the API call.
+            response = self._request(config=self.config)
+
+            # Update the pager's internal state with the new response
+            self._init_next_page(response)
+            return self.page # Return the newly fetched page items
+    ```
+    `next_page` checks if a `page_token` is available. If not, it raises `IndexError`. Otherwise, it calls the stored SDK list method (`self._request`) using the current configuration (`self._config`, which contains the `page_token`). The response from this API call is then used to re-initialize the pager's state via `self._init_next_page`.
+
+*   **Asynchronous Counterparts (`AsyncPager`)**
+    `AsyncPager` mirrors the `Pager` structure but uses `async def` for `__anext__` and `next_page`, and `await` when calling the asynchronous request function (`await self._request(...)`) and `await self.next_page()`.
+
+## Conclusion
+
+The `Pager` and `AsyncPager` classes are essential utilities in the `google-genai` SDK for gracefully handling paginated API responses. By providing a standard iterator interface (`for` loop / `async for`), they abstract away the need for developers to manually manage `next_page_token` values and repeated API calls when processing large lists of resources like models, files, or tuning jobs. While explicit page-by-page control is possible using the `page` property and `next_page()` method, the iterator pattern offers a significantly simpler and more Pythonic way to consume paginated data.
+
+Understanding pagination is important, but often you'll interact with data structures *before* they are sent to the API or *after* they are received. The next chapter, [Transformers (`t_` functions)](transformers___t___functions_.mdc), explores the internal helper functions the SDK uses to convert between user-friendly Python types and the structured objects required by the API.
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

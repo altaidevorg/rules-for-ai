@@ -1,0 +1,347 @@
+---
+description: Details Flax NNX nnx.Rngs for managing PRNG keys within Modules, explaining streams, key generation, and state management.
+globs: 
+alwaysApply: false
+---
+# Chapter 3: nnx.Rngs
+
+In the [previous chapter](nnx_variable___nnx_variablestate.mdc), we explored how `nnx.Variable` and `nnx.VariableState` manage state within `nnx.Module` instances. We saw specific variable types like `nnx.Param` and `nnx.BatchStat`. This chapter focuses on another crucial aspect of neural network initialization and certain layer types: managing randomness using `nnx.Rngs`.
+
+## Motivation: Explicit Randomness in JAX
+
+JAX's functional programming paradigm requires explicit handling of Pseudo-Random Number Generator (PRNG) keys. Unlike stateful libraries where randomness might be implicit via a global seed, JAX functions need PRNG keys passed as arguments. Manually managing and splitting these keys across complex nested modules can become tedious and error-prone.
+
+Flax NNX introduces `nnx.Rngs` to streamline PRNG key management. It acts as a central container for different "streams" of randomness (e.g., one for parameter initialization, another for dropout). Modules request keys from specific streams as needed, and `nnx.Rngs` ensures unique keys are generated sequentially, maintaining reproducibility and fitting within JAX's functional requirements.
+
+## Central Use Case: Initializing Modules with Randomness
+
+Most neural networks require random initialization for parameters, and some layers (like dropout) require randomness during the forward pass. `nnx.Rngs` is typically instantiated once at the top level and passed down the module hierarchy during construction.
+
+```python
+import jax
+import jax.numpy as jnp
+from flax import nnx
+from flax.nnx.nn import Linear, Dropout # Using pre-built NNX layers
+
+class SimpleMLP(nnx.Module):
+  def __init__(self, din: int, dhidden: int, dout: int, *, rngs: nnx.Rngs):
+    # Pass the Rngs instance down to submodules
+    self.linear1 = Linear(din, dhidden, rngs=rngs)
+    # Dropout requires an RNG key for its mask generation setup
+    self.dropout = Dropout(rate=0.5, rngs=rngs) 
+    self.linear2 = Linear(dhidden, dout, rngs=rngs)
+
+  def __call__(self, x: jax.Array, *, train: bool) -> jax.Array:
+    x = self.linear1(x)
+    x = nnx.relu(x)
+    # Pass deterministic flag to control dropout behavior
+    x = self.dropout(x, deterministic=not train) 
+    x = self.linear2(x)
+    return x
+
+# 1. Instantiate Rngs at the top level with a base seed (0)
+#    Specify different seeds for specific streams if needed.
+top_level_rngs = nnx.Rngs(default=0, params=1, dropout=2)
+
+# 2. Pass the Rngs instance during MLP initialization
+mlp = SimpleMLP(din=10, dhidden=20, dout=5, rngs=top_level_rngs)
+
+# Create dummy data
+x = jnp.ones((1, 10))
+
+# Run in training mode (dropout active)
+# Dropout internally uses its 'dropout' stream key, implicitly managed by nnx.Dropout
+y_train = mlp(x, train=True)
+
+# Run in evaluation mode (dropout inactive)
+y_eval = mlp(x, train=False)
+
+print(f"MLP Output shape (train): {y_train.shape}")
+print(f"MLP Output shape (eval): {y_eval.shape}")
+
+# Inspect the state to see the RngState variables managed internally
+mlp_state = nnx.state(mlp)
+print("\nMLP State showing RngState for Dropout:")
+# Note: Linear layers use 'params' stream *during init*, but don't store RngState after.
+# Dropout stores RngState to generate masks *during calls*.
+print(mlp_state['dropout']) 
+```
+
+**Example Output:**
+
+```
+MLP Output shape (train): (1, 5)
+MLP Output shape (eval): (1, 5)
+
+MLP State showing RngState for Dropout:
+{'rngs': State({ # This structure holds the RngState for the dropout stream
+    'dropout': VariableState(type=RngStream, ... contains RngKey & RngCount ...)
+  })
+}
+```
+
+In this example:
+1.  We create an `nnx.Rngs` instance, providing different integer seeds for the `default`, `params`, and `dropout` streams.
+2.  This `top_level_rngs` object is passed to the `SimpleMLP` constructor.
+3.  Inside `SimpleMLP.__init__`, the *same* `rngs` object is passed to the `Linear` and `Dropout` constructors.
+4.  `nnx.Linear` requests keys from the `'params'` stream (implicitly, via its default initializers) to initialize `kernel` and `bias`.
+5.  `nnx.Dropout` requests a key from the `'dropout'` stream (as specified by its default `rng_collection`) and stores it internally as an `nnx.RngState` variable (actually within an internal `Rngs` instance it creates from the stream).
+6.  Because the *same* `Rngs` instance is used, sequential calls like `rngs.params()` within the `Linear` initializations retrieve *unique* keys due to internal counter increments.
+
+## Key Concepts
+
+### 1. RNG Streams (`params`, `dropout`, `default`, etc.)
+
+`nnx.Rngs` manages multiple independent random number streams, identified by string names. This allows different parts of your model or different processes (like initialization vs. stochastic layers) to draw from separate sequences of random numbers, improving reproducibility and control.
+
+*   **Common Streams:**
+    *   `'params'`: Conventionally used for parameter initialization.
+    *   `'dropout'`: Conventionally used by dropout layers.
+    *   `'default'`: Used if a stream name is requested that wasn't explicitly initialized. The seed for this stream is provided as the first positional argument to `nnx.Rngs`.
+*   **Custom Streams:** You can define and use any stream name.
+
+```python
+# Default stream seed = 0
+# 'params' stream seed = 1
+# 'custom_noise' stream seed = 42
+rngs = nnx.Rngs(0, params=1, custom_noise=42) 
+
+# Request keys
+default_key = rngs.default() # or just rngs()
+params_key1 = rngs.params()
+params_key2 = rngs.params() # Gets a different key than params_key1
+dropout_key = rngs.dropout() # Uses 'default' stream (seed 0) as 'dropout' wasn't specified
+custom_key = rngs.custom_noise()
+
+print(f"params_key1 != params_key2: {not jnp.array_equal(params_key1, params_key2)}")
+# Output: params_key1 != params_key2: True
+```
+
+### 2. Initialization with Seeds
+
+You initialize `nnx.Rngs` with integer seeds. Each named stream gets its own JAX PRNGKey derived from its seed.
+
+```python
+# Option 1: Only default seed
+rngs_default = nnx.Rngs(0) 
+# 'params', 'dropout', etc., will all derive from seed 0 initially
+
+# Option 2: Specify seeds for streams
+rngs_specific = nnx.Rngs(default=10, params=20, dropout=30)
+
+# Option 3: Pass a dictionary
+seed_dict = {'default': 0, 'params': 1}
+rngs_dict = nnx.Rngs(seed_dict) 
+
+# Option 4: Pass JAX keys directly (less common for top-level)
+key_params = jax.random.key(1)
+key_dropout = jax.random.key(2)
+rngs_keys = nnx.Rngs(params=key_params, dropout=key_dropout) 
+# Note: 'default' stream won't exist unless explicitly provided or derived.
+```
+Using integer seeds is the most common and recommended approach for initial setup.
+
+### 3. Unique Key Generation (`fold_in` + Counter)
+
+When you request a key from a stream (e.g., `rngs.params()`), `nnx.Rngs` does the following internally for that stream:
+1.  Retrieves the stream's base JAX key and its current counter value (initially 0).
+2.  Generates a new, unique key using `jax.random.fold_in(base_key, counter)`. `fold_in` deterministically mixes the counter value into the key.
+3.  Increments the stream's internal counter.
+4.  Returns the newly generated key.
+
+This mechanism ensures that even if the same stream (`'params'`) is accessed multiple times sequentially (e.g., by different layers during initialization within the same `nnx.Module`), each call receives a unique PRNGKey, preventing accidental reuse and ensuring deterministic initialization given the same starting seeds.
+
+```python
+rngs = nnx.Rngs(params=42)
+
+# Simulate internal state (conceptual)
+# stream 'params': base_key = jax.random.key(42), count = 0
+
+key1 = rngs.params() 
+# Internally: key1 = fold_in(base_key, 0), count becomes 1
+print(f"Key 1: {key1}")
+
+key2 = rngs.params() 
+# Internally: key2 = fold_in(base_key, 1), count becomes 2
+print(f"Key 2: {key2}")
+
+key3 = rngs.params()
+# Internally: key3 = fold_in(base_key, 2), count becomes 3
+print(f"Key 3: {key3}")
+
+assert not jnp.array_equal(key1, key2)
+assert not jnp.array_equal(key2, key3)
+```
+
+### 4. Integration with `nnx.Module`
+
+Modules that require randomness typically accept an `rngs: nnx.Rngs` argument in their `__init__` method. They then use this `rngs` object to request keys from the appropriate streams for their internal needs (e.g., parameter initializers, dropout setup).
+
+```python
+from flax.nnx.nn import initializers
+
+class CustomLayer(nnx.Module):
+  def __init__(self, features: int, *, rngs: nnx.Rngs):
+    # Request a key specifically from the 'params' stream
+    param_key = rngs.params() 
+    self.weight = nnx.Param(initializers.lecun_normal()(param_key, (features, features)))
+    
+    # Maybe setup something else with a different stream
+    noise_key = rngs.custom_noise() # Assumes 'custom_noise' was setup in Rngs
+    # ... use noise_key ...
+
+# User code:
+rngs = nnx.Rngs(0, params=1, custom_noise=2)
+layer = CustomLayer(features=5, rngs=rngs) 
+```
+
+### 5. State Management (`RngStream`, `RngKey`, `RngCount`)
+
+Internally, `nnx.Rngs` manages its state using helper objects:
+*   **`nnx.RngStream`**: An object associated with each named stream (e.g., `rngs.params` is an `RngStream`). It holds the actual state for that stream.
+*   **`nnx.RngKey`**: An `nnx.RngState` variable (subclass of [nnx.Variable](nnx_variable___nnx_variablestate.mdc)) inside `RngStream` holding the base JAX PRNGKey for that stream.
+*   **`nnx.RngCount`**: An `nnx.RngState` variable inside `RngStream` holding the integer counter for that stream.
+
+Because `RngKey` and `RngCount` are `nnx.Variable` subtypes, their state (the actual key array and counter value) is tracked by the NNX framework. This means when you use `nnx.split`, the state of the RNG counters is preserved in the `State` object, and when you use `nnx.merge`, it's restored. This is crucial for reproducibility, especially when dealing with JAX transformations.
+
+```python
+rngs = nnx.Rngs(default=0, params=1)
+key1 = rngs.params() # Increment params counter to 1
+key2 = rngs.default() # Increment default counter to 1
+
+# Split the Rngs object (though usually done on a Module containing it)
+graphdef, state = nnx.split(rngs)
+print("Rngs State:")
+# Shows RngKey (holding the base key) and RngCount (holding the current count)
+print(state) 
+
+# Modify the state (e.g., increment count manually - not typical usage)
+# state['params']['count'].value += 10 # state is immutable, need functional update
+
+# Merge back (restores the counters to their values in 'state')
+rngs_merged = nnx.merge(graphdef, state)
+
+# Next key will be based on the restored count
+key3_params = rngs_merged.params() # Uses count = 1 internally, returns fold_in(base, 1)
+key3_default = rngs_merged.default() # Uses count = 1 internally, returns fold_in(base, 1)
+
+print(f"\nNext params key after merge: {key3_params}") 
+```
+**Example Output (structure/types shown):**
+```
+Rngs State:
+State({
+  'default': State({
+    'count': VariableState(type=RngCount, value=Array(1, dtype=uint32), tag='default'), 
+    'key': VariableState(type=RngKey, value=Array([...], dtype=uint32), tag='default')
+    }), 
+  'params': State({
+    'count': VariableState(type=RngCount, value=Array(1, dtype=uint32), tag='params'), 
+    'key': VariableState(type=RngKey, value=Array([...], dtype=uint32), tag='params')
+    })
+  })
+
+Next params key after merge: [... key derived from count 1 ...]
+```
+
+## Internal Implementation Insights
+
+**High-Level Walkthrough:**
+
+1.  **Instantiation (`Rngs.__init__`)**: Takes integer seeds or keys. For each stream name (`default`, `params`, etc.), it creates a JAX key (if a seed was given) and initializes an `RngStream` object with that key and a counter initialized to `0`. These `RngStream` objects are stored as attributes on the `Rngs` instance.
+2.  **Attribute Access (`Rngs.__getattr__`)**: When you access `rngs.stream_name`, it retrieves the corresponding `RngStream` attribute. If the name doesn't exist, it tries to use the `default` stream.
+3.  **Calling a Stream (`RngStream.__call__`)**: This is where the key generation happens. It accesses its internal `RngKey.value` (base key) and `RngCount.value` (current count). It computes `jax.random.fold_in(key, count)`, increments `RngCount.value`, and returns the folded-in key.
+
+**Code References (`flax/nnx/rnglib.py`):**
+
+*   `nnx.Rngs`: The main container class. Handles initialization and attribute access (`__init__`, `__getattr__`, `__getitem__`).
+*   `nnx.RngStream`: Holds the state for a single stream. Contains `key` and `count` attributes. Its `__call__` method implements the `fold_in` logic and counter increment.
+*   `nnx.RngKey`, `nnx.RngCount`: Subclasses of `nnx.RngState` (which is a `nnx.Variable`), used to wrap the JAX key array and the integer counter, making them part of the NNX state management system.
+
+**Sequence Diagram (Module Initialization):**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Rngs
+    participant MyModule
+    participant Linear1 as Linear(name='linear1')
+    participant Linear2 as Linear(name='linear2')
+    participant ParamsStream as RngStream ('params')
+
+    User->>Rngs: Instantiate Rngs(params=1)
+    activate Rngs
+    Rngs->>ParamsStream: Create RngStream(key=jax.random.key(1), count=0)
+    activate ParamsStream
+    ParamsStream-->>Rngs: 
+    deactivate ParamsStream
+    Rngs-->>User: Return Rngs instance
+    deactivate Rngs
+
+    User->>MyModule: Instantiate MyModule(rngs=Rngs)
+    activate MyModule
+    MyModule->>Linear1: Instantiate Linear(..., rngs=Rngs)
+    activate Linear1
+    Linear1->>Rngs: Request rngs.params() for kernel
+    activate Rngs
+    Rngs->>ParamsStream: Call __call__()
+    activate ParamsStream
+    ParamsStream-->>Rngs: Return fold_in(key, 0)
+    Rngs->>ParamsStream: Increment count to 1
+    deactivate ParamsStream
+    Rngs-->>Linear1: Return unique_key_0
+    deactivate Rngs
+    Linear1->>Rngs: Request rngs.params() for bias
+    activate Rngs
+    Rngs->>ParamsStream: Call __call__()
+    activate ParamsStream
+    ParamsStream-->>Rngs: Return fold_in(key, 1)
+    Rngs->>ParamsStream: Increment count to 2
+    deactivate ParamsStream
+    Rngs-->>Linear1: Return unique_key_1
+    deactivate Rngs
+    Linear1-->>MyModule: Return Linear1 instance
+    deactivate Linear1
+
+    MyModule->>Linear2: Instantiate Linear(..., rngs=Rngs)
+    activate Linear2
+    Linear2->>Rngs: Request rngs.params() for kernel
+    activate Rngs
+    Rngs->>ParamsStream: Call __call__()
+    activate ParamsStream
+    ParamsStream-->>Rngs: Return fold_in(key, 2)
+    Rngs->>ParamsStream: Increment count to 3
+    deactivate ParamsStream
+    Rngs-->>Linear2: Return unique_key_2
+    deactivate Rngs
+    Linear2->>Rngs: Request rngs.params() for bias
+    activate Rngs
+    Rngs->>ParamsStream: Call __call__()
+    activate ParamsStream
+    ParamsStream-->>Rngs: Return fold_in(key, 3)
+    Rngs->>ParamsStream: Increment count to 4
+    deactivate ParamsStream
+    Rngs-->>Linear2: Return unique_key_3
+    deactivate Rngs
+    Linear2-->>MyModule: Return Linear2 instance
+    deactivate Linear2
+    MyModule-->>User: Return MyModule instance
+    deactivate MyModule
+```
+This diagram shows how sequential requests to `rngs.params()` from different layers within the same initialization process yield unique keys due to the counter mechanism in the shared `RngStream`.
+
+## Advanced Topics
+
+*   **`nnx.split_rngs` / `nnx.restore_rngs`**: Sometimes, particularly when using JAX transformations like `jax.vmap` or `jax.pmap` that require data parallelism over randomness, you need to explicitly split a base key into multiple independent keys. `nnx.split_rngs` modifies the `RngKey` variables within an `Rngs` object (or a Module containing one) to hold *multiple* keys (one for each split), and `nnx.restore_rngs` reverts this. These are often used in conjunction with [NNX Lifted Transforms (jit, grad, vmap, scan, etc.)](nnx_lifted_transforms__jit__grad__vmap__scan__etc__.mdc).
+*   **`nnx.reseed`**: Allows you to reset the base key and counter for specific streams in an existing `Rngs` object or Module.
+
+## Conclusion
+
+`nnx.Rngs` provides a crucial, user-friendly abstraction for managing PRNG keys in Flax NNX. By organizing keys into named streams and automatically generating unique keys via internal counters and `jax.random.fold_in`, it simplifies the process of initializing modules and handling stochastic operations while adhering to JAX's requirement for explicit RNG handling. Its state (`RngKey`, `RngCount`) is managed via `nnx.Variable` subtypes, ensuring proper integration with NNX's functional API (`split`/`merge`) and JAX transformations.
+
+In the next chapter, we will explore how to selectively operate on different parts of the module state (like parameters, batch stats, or RNG state) using [Filters (`filterlib`)](filters___filterlib__.mdc).
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

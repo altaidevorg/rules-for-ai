@@ -1,0 +1,245 @@
+---
+description: Details google-adk's Event object, representing interaction units with author, content, actions, and metadata within a Session.
+globs: src/google/adk/events/event.py
+alwaysApply: false
+---
+# Chapter 5: Event
+
+In the [previous chapter](state.mdc), we explored how the `State` object manages the dynamic context within a conversation, tracking changes via deltas. But how are these changes, along with the actual messages and actions, recorded chronologically? This chapter introduces the `Event` object, the fundamental unit representing a single interaction step within a [Session](session__session___basesessionservice_.mdc).
+
+## Motivation and Use Case
+
+A simple list of text messages isn't sufficient to fully capture a complex agent interaction. We need a richer structure to represent:
+*   **Who** said or did something (user or a specific agent)?
+*   **What** was the content (text, but also structured data like function calls/responses, or even references to binary artifacts)?
+*   What **actions** were associated with this step (e.g., updating the [State](state.mdc), transferring control to another agent)?
+*   What **metadata** provides context (when did it happen, which agent invocation generated it, does it belong to a specific sub-conversation branch)?
+
+The `Event` object provides this structured representation. It serves as the immutable log entry for every significant occurrence within a conversation, forming the history stored in `Session.events`. This detailed history is crucial for providing context to the LLM, enabling multi-turn dialogue, debugging agent behavior, and evaluating performance.
+
+**Central Use Case:** A user asks our travel agent bot, "Book a flight to Paris for next Tuesday."
+1.  The [Runner](runner.mdc) receives this input and creates an `Event` (`author='user'`, `content=...`). This event is added to the [Session](session__session___basesessionservice_.mdc).
+2.  The [Agent (BaseAgent / LlmAgent)](agent__baseagent___llmagent_.mdc) processes this. The underlying [BaseLlmFlow](basellmflow.mdc) might yield an `Event` representing the LLM's decision to call a flight search tool (`author='travel_agent'`, `content=...FunctionCall...`). This event is added to the session.
+3.  The `search_flights` [Tool (BaseTool)](tool__basetool_.mdc) executes and returns results. The flow generates an `Event` containing the results (`author='search_flights'`, `content=...FunctionResponse...`) and possibly updates the state (`actions.state_delta={'found_flights': [...]}`). This event is added.
+4.  The flow sends the results back to the LLM, which generates the final response. The flow yields one or more `Event` objects containing the text parts of the response (`author='travel_agent'`, `content=...Part(text=...)`). These are added.
+Each step generates a distinct `Event`, collectively forming a detailed, replayable history of the interaction.
+
+## Key Concepts
+
+*   **Interaction Unit:** An `Event` represents a single, meaningful step in the conversation.
+*   **Author (`author`):** A string identifying the originator: `'user'` for end-user input, or the `name` of the [Agent (BaseAgent / LlmAgent)](agent__baseagent___llmagent_.mdc) or [Tool (BaseTool)](tool__basetool_.mdc) that generated the event.
+*   **Content (`content`):** A `google.genai.types.Content` object holding the substance of the event. This mirrors the Gemini API structure and can contain:
+    *   `Part(text=...)`: Plain text messages.
+    *   `Part(function_call=...)`: Requests from the LLM to execute a tool.
+    *   `Part(function_response=...)`: Results returned from a tool execution.
+    *   `Part(code_execution_result=...)`: Output from code execution.
+    *   Placeholders for artifacts (binary data handled by `BaseArtifactService`).
+*   **Actions (`actions`):** An `EventActions` object containing associated side effects or metadata about the event's processing:
+    *   `state_delta`: A dictionary of changes to be applied to the session's [State](state.mdc).
+    *   `transfer_to_agent`: The name of another agent to which control should be transferred.
+    *   `skip_summarization`: A flag for tool responses, indicating the response shouldn't be summarized by the LLM before being stored.
+    *   `requested_auth_configs`: Authentication details needed for a tool.
+*   **Metadata:**
+    *   `id`: A unique, randomly generated identifier for this specific event.
+    *   `timestamp`: A float representing the creation time (`datetime.now().timestamp()`).
+    *   `invocation_id`: A string linking events generated within the same single call to `Runner.run_async`. Essential for tracing a single turn.
+    *   `branch`: An optional string (e.g., `coordinator.researcher`) indicating the position in a hierarchical agent execution path. Useful for isolating histories in complex multi-agent scenarios.
+*   **Inheritance (`LlmResponse`):** `Event` inherits from `LlmResponse`, signifying that many events originate from or relate to LLM interactions. `LlmResponse` provides the basic structure for `content` and `partial` flags.
+*   **Partial Events (`partial`):** A boolean flag (from `LlmResponse`). If `True`, the event represents an intermediate chunk (e.g., during streaming) and is typically *not* persisted to the session history by the `BaseSessionService`. If `False`, it's considered a significant, complete step and is persisted.
+*   **History (`Session.events`):** Non-partial `Event` objects are appended chronologically to the `events` list within the [Session](session__session___basesessionservice_.mdc) object, forming the conversation history.
+*   **Generation Source:** Events are primarily generated by:
+    *   The [Runner](runner.mdc): Creates the initial 'user' event.
+    *   [Agent (BaseAgent / LlmAgent)](agent__baseagent___llmagent_.mdc) implementations (often via [BaseLlmFlow](basellmflow.mdc)): Generate events for LLM thoughts (if enabled), tool calls, tool responses, code execution, and final model responses.
+    *   [Tools (BaseTool)](tool__basetool_.mdc) or Callbacks: Can generate events, especially `function_response` events or events carrying specific `state_delta`.
+
+## How to Use `Event`
+
+As an application developer using the `Runner`, you primarily *consume* events yielded by `run_async`. You might inspect their attributes to understand the agent's process or extract final responses. Developers building custom agents, tools, or complex callbacks might need to *create* `Event` instances.
+
+1.  **Consuming Events from `Runner`:**
+
+    ```python
+    import asyncio
+    from google.adk.runners import Runner
+    from google.genai import types
+
+    async def process_agent_turn(runner: Runner, user_id: str, session_id: str, text: str):
+        new_message = types.Content(role="user", parts=[types.Part(text=text)])
+        final_response_parts = []
+
+        async for event in runner.run_async(
+            user_id=user_id, session_id=session_id, new_message=new_message
+        ):
+            print(f"Received Event: author={event.author}, id={event.id}, partial={event.partial}")
+            if event.content:
+                print(f"  Content Parts: {len(event.content.parts)}")
+                for part in event.content.parts:
+                    if part.text:
+                        print(f"    Text: '{part.text[:50]}...'")
+                    elif part.function_call:
+                        print(f"    Function Call: {part.function_call.name}")
+                    elif part.function_response:
+                        print(f"    Function Response: {part.function_response.name}")
+
+            if event.actions.state_delta:
+                print(f"  State Delta: {event.actions.state_delta}")
+
+            # Collect final response text
+            if event.is_final_response() and event.content:
+                final_response_parts.extend(event.content.parts)
+
+        final_text = "".join(p.text or "" for p in final_response_parts)
+        print(f"\nFinal Agent Response:\n{final_text}")
+
+    # Assuming 'runner' is initialized and session exists
+    # asyncio.run(process_agent_turn(runner, "user1", "sess1", "What's the weather like?"))
+    ```
+    *Technical Explanation:* The code iterates through events yielded by `runner.run_async`. It inspects common attributes like `author`, `content` (checking for text, function calls/responses), and `actions.state_delta`. It uses `event.is_final_response()` to identify and aggregate the final textual answer from the agent.
+
+2.  **Creating an Event (e.g., in a Custom Tool):**
+
+    ```python
+    from google.adk.events import Event, EventActions
+    from google.adk.tools import ToolContext # Provided to tool execution
+    from google.genai import types
+    from google.adk.sessions.state import State # For prefixes
+
+    async def my_custom_tool_logic(ctx: ToolContext, **kwargs) -> AsyncGenerator[Event, None]:
+        # Simulate tool work
+        tool_result = {"status": "success", "data": "some important data"}
+        user_preference = "dark_mode"
+
+        # Create an event representing the tool's result and state updates
+        tool_response_event = Event(
+            author=ctx.tool_config.name, # Tool name acts as author
+            invocation_id=ctx.invocation_id,
+            branch=ctx.branch,
+            content=types.Content(
+                parts=[
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name=ctx.tool_config.name,
+                            response=tool_result,
+                        )
+                    )
+                ]
+            ),
+            actions=EventActions(
+                state_delta={
+                    "last_tool_result": tool_result["data"], # Session state
+                    State.USER_PREFIX + "ui_theme": user_preference # User state
+                }
+            )
+        )
+        yield tool_response_event
+    ```
+    *Technical Explanation:* Inside a custom tool's logic, it constructs an `Event`. The `author` is set to the tool's name. The `content` contains a `FunctionResponse` part. Crucially, `actions` includes a `state_delta` to update both session-specific (`last_tool_result`) and user-specific (`user:ui_theme`) state. The `invocation_id` and `branch` are copied from the `ToolContext` (`ctx`) to link the event correctly.
+
+## Internal Implementation
+
+*   **`Event` Class Definition (`src/google/adk/events/event.py`):**
+    The `Event` is a Pydantic `BaseModel` inheriting from `LlmResponse`.
+
+    ```python
+    # Simplified from src/google/adk/events/event.py
+    from pydantic import BaseModel, Field
+    from datetime import datetime
+    from typing import Optional
+    from google.genai import types
+    from ..models.llm_response import LlmResponse # Superclass
+    from .event_actions import EventActions
+
+    class Event(LlmResponse):
+        # ... model_config ...
+        invocation_id: str = '' # Links events in one Runner turn
+        author: str           # 'user' or agent/tool name
+        actions: EventActions = Field(default_factory=EventActions)
+        branch: Optional[str] = None # Hierarchical context
+
+        # Computed fields
+        id: str = '' # Unique event ID, generated in model_post_init
+        timestamp: float = Field(default_factory=lambda: datetime.now().timestamp())
+
+        def model_post_init(self, __context):
+            if not self.id:
+                self.id = Event.new_id() # Generate random ID
+
+        def is_final_response(self) -> bool:
+            # Logic to check if it's a final answer (no function calls/responses, not partial etc.)
+            # ... implementation omitted ...
+
+        # Helper methods like get_function_calls(), get_function_responses()
+        # ... implementations omitted ...
+
+        @staticmethod
+        def new_id():
+            # Generates a short random string
+            # ... implementation omitted ...
+    ```
+    *Technical Explanation:* Defines the core fields (`author`, `actions`, `invocation_id`, `branch`) alongside fields inherited from `LlmResponse` (`content`, `partial`). It includes auto-generated `id` and `timestamp`. Helper methods simplify checking event type.
+
+*   **`EventActions` Class Definition (`src/google/adk/events/event_actions.py`):**
+    A simple Pydantic model holding the action details.
+
+    ```python
+    # Simplified from src/google/adk/events/event_actions.py
+    from pydantic import BaseModel, Field
+    from typing import Optional
+
+    class EventActions(BaseModel):
+        # ... model_config ...
+        skip_summarization: Optional[bool] = None
+        state_delta: dict[str, object] = Field(default_factory=dict)
+        artifact_delta: dict[str, int] = Field(default_factory=dict)
+        transfer_to_agent: Optional[str] = None
+        escalate: Optional[bool] = None
+        # ... other fields like requested_auth_configs ...
+    ```
+    *Technical Explanation:* A data container for various actions, most notably `state_delta` which links the event to state management.
+
+*   **Event Lifecycle and Persistence:**
+
+    ```mermaid
+    sequenceDiagram
+        participant UserApp
+        participant Runner
+        participant SessionService
+        participant Agent as Agent/Tool/Flow
+
+        UserApp->>+Runner: run_async(..., new_message)
+        Runner->>Runner: Create InvocationContext
+        Runner->>Runner: Create user_event (author='user')
+        Runner->>+SessionService: append_event(session, user_event) # Persists user event
+        SessionService-->>-Runner: user_event (with ID)
+
+        Runner->>+Agent: run_async(invocation_context) # or tool execution
+        Agent-->>-Runner: yield agent_event_partial (partial=True)
+        Runner-->>-UserApp: yield agent_event_partial # Forwarded, not saved
+
+        Agent-->>-Runner: yield agent_event_final (partial=False, maybe with actions.state_delta)
+        Runner->>+SessionService: append_event(session, agent_event_final) # Persists final event + state changes
+        SessionService-->>SessionService: Update session.events list
+        SessionService-->>SessionService: Process state_delta, update session.state
+        SessionService-->>-Runner: agent_event_final (with ID)
+        Runner-->>-UserApp: yield agent_event_final # Forward final event
+        Agent-->>-Runner: (run complete)
+        Runner-->>-UserApp: (async generator finishes)
+    ```
+    *Technical Explanation:* The diagram shows the flow:
+    1.  `Runner` creates and persists the initial `user` event via `SessionService`.
+    2.  The `Agent` (or underlying flow/tool) yields events.
+    3.  Partial events (`partial=True`) are forwarded by the `Runner` but *not* saved by `SessionService`.
+    4.  Non-partial events (`partial=False`) are sent to `SessionService.append_event`.
+    5.  `SessionService` appends the event to `session.events` and updates `session.state` based on `event.actions.state_delta`.
+    6.  The `Runner` forwards the non-partial event to the User App.
+
+## Conclusion
+
+The `Event` object is the granular record of interaction within `google-adk`. By capturing the author, content, actions, and essential metadata for each step, `Events` provide a rich, structured history within the [Session](session__session___basesessionservice_.mdc). This history is fundamental for enabling stateful, multi-turn conversations, debugging complex agent behaviors, and providing the necessary context for LLM reasoning. Events generated by agents and tools, carrying `actions.state_delta`, are the mechanism by which the conversation's [State](state.mdc) evolves over time.
+
+Having covered the core components of interaction flow ([Runner](runner.mdc)), actors ([Agent (BaseAgent / LlmAgent)](agent__baseagent___llmagent_.mdc)), memory ([Session (Session / BaseSessionService)](session__session___basesessionservice_.mdc)), context ([State](state.mdc)), and history units ([Event](event.mdc)), we now turn to the underlying engine driving much of this intelligence: the [BaseLlm](basellm.mdc).
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)
