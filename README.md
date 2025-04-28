@@ -2,9 +2,9 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-> *Why bother reading a full tutorial in the days of agentic coding? This is an AI agent that analyzes GitHub repositories and creates [Cursor Rules](https://docs.cursor.com/context/rules) that teaches AI how to develop with and/or for them.*
+> *Why bother reading a whole tutorial in the days of agentic coding? This is an AI agent that analyzes GitHub repositories and creates [Cursor Rules](https://docs.cursor.com/context/rules) that teaches AI how to develop with and/or for them.*
 
-This is a project inspired by and forked from [a great project of Pocket Flow](https://github.com/The-Pocket/Tutorial-Codebase-Knowledge), which generates tutorials for humans. We thought, tutorials are for humans, and rules are for AI. Hence, we modified it to generate [Cursor Rules](https://docs.cursor.com/context/rules) instead of beginner-friendly tutorials for humans. It crawls GitHub repositories and builds a knowledge base from the code. It analyzes entire codebases to identify core abstractions and how they interact, and creates `Project Rules` with code samples, default and optional values, architecture and design patterns, and an overview of the inner working of the code.
+This is a project inspired by and forked from [a great project of Pocket Flow](https://github.com/The-Pocket/Tutorial-Codebase-Knowledge), which generates tutorials for humans. We just thought, **tutorials are for humans, rules are for AI**. Hence, we modified it to generate [Cursor Rules](https://docs.cursor.com/context/rules) instead of beginner-friendly tutorials for humans. It crawls GitHub repositories and builds a knowledge base from the code. It analyzes entire codebases to identify core abstractions and how they interact, and creates `Project Rules` with code samples, default and optional values, architecture and design patterns, and an overview of the inner working of the code.
 
 **Cursor rules**:
 
