@@ -1,9 +1,15 @@
+import logging
 import os
 import yaml
 from pocketflow import Node, BatchNode
 from utils.crawl_github_files import crawl_github_files
 from utils.call_llm import call_llm
 from utils.crawl_local_files import crawl_local_files
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 
 # Helper to get content for specific file indices
@@ -49,7 +55,7 @@ class FetchRepo(Node):
 
     def exec(self, prep_res):
         if prep_res["repo_url"]:
-            print(f"Crawling repository: {prep_res['repo_url']}...")
+            logging.info(f"Crawling repository: {prep_res['repo_url']}...")
             result = crawl_github_files(
                 repo_url=prep_res["repo_url"],
                 token=prep_res["token"],
@@ -59,7 +65,7 @@ class FetchRepo(Node):
                 use_relative_paths=prep_res["use_relative_paths"],
             )
         else:
-            print(f"Crawling directory: {prep_res['local_dir']}...")
+            logging.info(f"Crawling directory: {prep_res['local_dir']}...")
             result = crawl_local_files(
                 directory=prep_res["local_dir"],
                 include_patterns=prep_res["include_patterns"],
@@ -72,7 +78,7 @@ class FetchRepo(Node):
         files_list = list(result.get("files", {}).items())
         if len(files_list) == 0:
             raise (ValueError("Failed to fetch files"))
-        print(f"Fetched {len(files_list)} files.")
+        logging.info(f"Fetched {len(files_list)} files.")
         return files_list
 
     def post(self, shared, prep_res, exec_res):
@@ -111,7 +117,7 @@ class IdentifyAbstractions(Node):
         context, file_listing_for_prompt, file_count, project_name = (
             prep_res  # Unpack project name and other extracted data
         )
-        print("Identifying abstractions using LLM...")
+        logging.info("Identifying abstractions using LLM...")
 
         prompt = f"""
 For the project `{project_name}`:
@@ -202,7 +208,7 @@ Format the output as a YAML list of dictionaries:
                 }
             )
 
-        print(f"Identified {len(validated_abstractions)} abstractions.")
+        logging.info(f"Identified {len(validated_abstractions)} abstractions.")
         return validated_abstractions
 
     def post(self, shared, prep_res, exec_res):
@@ -251,7 +257,7 @@ class AnalyzeRelationships(Node):
         context, abstraction_listing, project_name = (
             prep_res  # Unpack project name and other extracted data
         )
-        print("Analyzing relationships using LLM...")
+        logging.info("Analyzing relationships using LLM...")
 
         prompt = f"""
 Based on the following abstractions and relevant code snippets from the project `{project_name}`:
@@ -344,7 +350,7 @@ Now, provide the YAML output:
             except (ValueError, TypeError):
                 raise ValueError(f"Could not parse indices from relationship: {rel}")
 
-        print("Generated project summary and relationship details.")
+        logging.info("Generated project summary and relationship details.")
         return {
             "summary": relationships_data["summary"],  # Potentially translated summary
             "details": validated_relationships,  # Store validated, index-based relationships with potentially translated labels
@@ -384,7 +390,7 @@ class OrderChapters(Node):
 
     def exec(self, prep_res):
         abstraction_listing, context, num_abstractions, project_name = prep_res
-        print("Determining chapter order using LLM...")
+        logging.info("Determining chapter order using LLM...")
         prompt = f"""
 Given the following project abstractions and their relationships for the project ```` {project_name} ````:
 
@@ -448,7 +454,7 @@ Now, provide the YAML output:
                 f"Ordered list length ({len(ordered_indices)}) does not match number of abstractions ({num_abstractions}). Missing indices: {set(range(num_abstractions)) - seen_indices}"
             )
 
-        print(f"Determined chapter order (indices): {ordered_indices}")
+        logging.info(f"Determined chapter order (indices): {ordered_indices}")
         return ordered_indices  # Return the list of indices
 
     def post(self, shared, prep_res, exec_res):
@@ -531,11 +537,11 @@ class WriteChapters(BatchNode):
                     }
                 )
             else:
-                print(
-                    f"Warning: Invalid abstraction index {abstraction_index} in chapter_order. Skipping."
+                logging.warning(
+                    f"Invalid abstraction index {abstraction_index} in chapter_order. Skipping."
                 )
 
-        print(f"Preparing to write {len(items_to_process)} chapters...")
+        logging.info(f"Preparing to write {len(items_to_process)} chapters...")
         return items_to_process  # Iterable for BatchNode
 
     def exec(self, item):
@@ -544,7 +550,9 @@ class WriteChapters(BatchNode):
         abstraction_description = item["abstraction_details"]["description"]
         chapter_num = item["chapter_num"]
         project_name = item.get("project_name")
-        print(f"Writing chapter {chapter_num} for: {abstraction_name} using LLM...")
+        logging.info(
+            f"Writing chapter {chapter_num} for: {abstraction_name} using LLM..."
+        )
 
         # Prepare file context string from the map
         file_context_str = "\n\n".join(
@@ -580,7 +588,7 @@ Instructions for the chapter:
 
 ```yaml
 description: A 10-15-word description containing the project name and abstractions / concepts detailed in this chapter. AI will decide when to refer to this chapter based on this description.
-globs: Empty or a single glob pattern. If matched with a code file, it will be automatically picked by the AI agent whenever that file is mentioned. Empty almost all the time. Set it to a pattern only for **very, very specific abstractions**, e.g., a single class in a file.
+globs: Empty or a single glob pattern string. If matched with a code file, it will be automatically picked by the AI agent whenever that file is mentioned. Empty string almost all the time. Set it to a pattern only for **very, very specific abstractions**, e.g., a single class in a file.
 alwaysApply: false almost all the time. set it to true only for **very, very central abstractions**.
 content: |
   Full chapter content in Markdown format.
@@ -627,6 +635,13 @@ Now provide the YAML output for this chapter.
                 "LLM output is not a dictionary or has missing keys", chapter_data
             )
 
+        if chapter_data["globs"] is None or (
+            isinstance(chapter_data["globs"], list) and len(chapter_data["globs"]) == 0
+        ):
+            chapter_data["globs"] = " "
+        elif isinstance(chapter_data["globs"], str):
+            chapter_data["globs"] = chapter_data["globs"].strip()
+
         if not all(isinstance(k, str) for k in ["description", "globs", "content"]):
             raise ValueError(
                 "description, globs or content is not a string", chapter_data
@@ -670,14 +685,14 @@ Now provide the YAML output for this chapter.
         shared["chapters"] = exec_res_list
         # Clean up the temporary instance variable
         del self.chapters_written_so_far
-        print(f"Finished writing {len(exec_res_list)} chapters.")
+        logging.info(f"Finished writing {len(exec_res_list)} chapters.")
 
 
 class CombineTutorial(Node):
     def prep(self, shared):
         project_name = shared["project_name"]
         output_base_dir = shared.get("output_dir", "output")  # Default output dir
-        output_path = os.path.join(output_base_dir, project_name, ".cursor", "rules")
+        output_path = os.path.join(output_base_dir, project_name)
         repo_url = shared.get("repo_url")  # Get the repository URL
 
         # Get potentially translated data
@@ -751,8 +766,8 @@ class CombineTutorial(Node):
                 # Store filename and corresponding content
                 chapter_files.append({"filename": filename, "content": chapter_content})
             else:
-                print(
-                    f"Warning: Mismatch between chapter order, abstractions, or content at index {i} (abstraction index {abstraction_index}). Skipping file generation for this entry."
+                logging.warning(
+                    f"Mismatch between chapter order, abstractions, or content at index {i} (abstraction index {abstraction_index}). Skipping file generation for this entry."
                 )
 
         # Add attribution to index content
@@ -769,7 +784,7 @@ class CombineTutorial(Node):
         index_content = prep_res["index_content"]
         chapter_files = prep_res["chapter_files"]
 
-        print(f"Combining rules into directory: {output_path}")
+        logging.info(f"Combining rules into directory: {output_path}")
         # Rely on Node's built-in retry/fallback
         os.makedirs(output_path, exist_ok=True)
 
@@ -777,17 +792,17 @@ class CombineTutorial(Node):
         index_filepath = os.path.join(output_path, "guide.mdc")
         with open(index_filepath, "w", encoding="utf-8") as f:
             f.write(index_content)
-        print(f"  - Wrote {index_filepath}")
+        logging.info(f"  - Wrote {index_filepath}")
 
         # Write chapter files
         for chapter_info in chapter_files:
             chapter_filepath = os.path.join(output_path, chapter_info["filename"])
             with open(chapter_filepath, "w", encoding="utf-8") as f:
                 f.write(chapter_info["content"])
-            print(f"  - Wrote {chapter_filepath}")
+            logging.info(f"  - Wrote {chapter_filepath}")
 
         return output_path  # Return the final path
 
     def post(self, shared, prep_res, exec_res):
         shared["final_output_dir"] = exec_res  # Store the output path
-        print(f"\n.cursor/rules generation complete! Files are in: {exec_res}")
+        logging.info(f"\n.cursor/rules generation complete! Files are in: {exec_res}")
