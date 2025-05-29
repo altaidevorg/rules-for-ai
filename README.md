@@ -28,10 +28,10 @@ This is a project inspired by and forked from [a great project of Pocket Flow](h
 
 ## 🚀 Getting Started
 
-1. Clone this repository and then set you `GEMINI_API_KEY` environment variable:
+1. Clone this repository and then set your Gemini API key environment variable:
 
 ```bash
-export GEMINI_API_KEY=your_api_key_here
+export GOOGLE_API_KEY=your_api_key_here
 ```
 
 2. Install dependencies:
