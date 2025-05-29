@@ -587,7 +587,7 @@ Instructions for the chapter:
 - Prepend the Markdown content with metadata described below to tell the AI agent when to refer to this particular chapter:
 
 ```yaml
-description: A 10-15-word description containing the project name and abstractions / concepts detailed in this chapter. AI will decide when to refer to this chapter based on this description.
+description: "A 10-15-word description containing the project name and abstractions / concepts detailed in this chapter. AI will decide when to refer to this chapter based on this description."
 globs: Empty or a single glob pattern string. If matched with a code file, it will be automatically picked by the AI agent whenever that file is mentioned. Empty string almost all the time. Set it to a pattern only for **very, very specific abstractions**, e.g., a single class in a file.
 alwaysApply: false almost all the time. set it to true only for **very, very central abstractions**.
 content: |
@@ -604,15 +604,15 @@ content: |
 
 - Explain how to use this abstraction to solve the use case. Give example inputs and outputs for code snippets (if the output isn't values, describe at a high level what will happen). Mention about default and/or optional values, if applicable.
 
+- Focus on practical usage examples and code architecture. Remember that the output will be used by a less-capable coding agent, so be direct and authoritative.
+
 - Each code block should be BELOW 20 lines! If longer code blocks are needed, break them down into smaller pieces and walk through them one-by-one. Aggresively simplify the code to make it minimal. Use comments to skip non-important implementation details. Each code block should have a technical explanation right after it.
 
-- Describe the internal implementation to help understand what's under the hood. First provide a non-code or code-light walkthrough on what happens step-by-step when the abstraction is called. It's recommended to use a simple sequenceDiagram with a dummy example - keep it minimal with at most 5 participants to ensure clarity. If participant name has space, use: `participant QP as Query Processing`.
+- Describe the internal implementation to help understand what's under the hood. First provide a non-code or code-light walkthrough on what happens step-by-step when the abstraction is called. It's recommended to examplify inputs and outputs if applicable.
 
 - Then dive deeper into code for the internal implementation with references to files. Provide example code blocks, but keep it minimal  and knowledge-dense, and do so only to help the AI agent better understand the inner working of the code at a higher level.
 
 - IMPORTANT: When you need to refer to other core abstractions covered in other chapters, ALWAYS use proper Markdown links like this: [Chapter Title](filename.md). Use the Complete Tutorial Structure above to find the correct filename and the chapter title.
-
-- Use mermaid diagrams to illustrate complex concepts (```mermaid``` format)..
 
 - Properly use technical terms and software engineering concepts throughout to help the coding AI agent develop with and/or for this project.
 
@@ -703,43 +703,11 @@ class CombineTutorial(Node):
         abstractions = shared["abstractions"]  # list of dicts
         chapters_content = shared["chapters"]  # list of strings
 
-        # --- Generate Mermaid Diagram ---
-        mermaid_lines = ["flowchart TD"]
-        # Add nodes for each abstraction using potentially translated names
-        for i, abstr in enumerate(abstractions):
-            node_id = f"A{i}"
-            # Use potentially translated name, sanitize for Mermaid ID and label
-            sanitized_name = abstr["name"].replace('"', "")
-            node_label = sanitized_name  # Using sanitized name only
-            mermaid_lines.append(
-                f'    {node_id}["{node_label}"]'
-            )  # Node label uses potentially translated name
-        # Add edges for relationships using potentially translated labels
-        for rel in relationships_data["details"]:
-            from_node_id = f"A{rel['from']}"
-            to_node_id = f"A{rel['to']}"
-            # Use potentially translated label, sanitize
-            edge_label = (
-                rel["label"].replace('"', "").replace("\n", " ")
-            )  # Basic sanitization
-            max_label_len = 30
-            if len(edge_label) > max_label_len:
-                edge_label = edge_label[: max_label_len - 3] + "..."
-            mermaid_lines.append(
-                f'    {from_node_id} -- "{edge_label}" --> {to_node_id}'
-            )  # Edge label uses potentially translated label
-
-        mermaid_diagram = "\n".join(mermaid_lines)
-        # --- End Mermaid ---
-
         # --- Prepare guide.mdc content ---
         index_content = f"---\ndescription: Guidelines for using {project_name}\nglobs: \nalwaysApply: true\n---\n"
         index_content += f"{relationships_data['summary']}\n\n"
         index_content += f"**Source Repository:** [{repo_url}]({repo_url})\n\n"
 
-        # Add Mermaid diagram for relationships (diagram itself uses potentially translated names/labels)
-        index_content += "```mermaid\n"
-        index_content += mermaid_diagram + "\n"
         index_content += "```\n\n"
 
         index_content += "## Chapters\n\n"
